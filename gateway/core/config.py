@@ -180,6 +180,27 @@ class AdmissionConfig:
 
 
 @dataclass(slots=True)
+class CalibrationConfig:
+    """Коэффициенты модели времени префилла (§3.3.6.7a).
+
+    `measured` отличает результат калибровочного прогона от значений по
+    умолчанию. Это не украшение: роутер, работающий на выдуманных
+    коэффициентах, принимает решения, которые выглядят обоснованными, но
+    ничем не обоснованы. Отличать одно от другого надо явно.
+    """
+
+    const_ms: float = 15.0
+    per_token_ms: float = 0.04
+    quadratic_ms: float = 1.5
+    measured: bool = False
+    mean_rel_err: float = 0.0
+
+    def as_dict(self) -> dict[str, float]:
+        return {"const_ms": self.const_ms, "per_token_ms": self.per_token_ms,
+                "quadratic_ms": self.quadratic_ms}
+
+
+@dataclass(slots=True)
 class GatewayConfig:
     slo: SLOConfig = field(default_factory=SLOConfig)
     router: RouterConfig = field(default_factory=RouterConfig)
@@ -189,6 +210,7 @@ class GatewayConfig:
     tenants: dict[str, Tenant] = field(default_factory=dict)
     rate_limits: tuple[RateLimitRule, ...] = ()
     fallbacks: tuple[FallbackRule, ...] = ()
+    calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
     version: int = 0
 
     def upstreams_for(self, model: str) -> list[Upstream]:
@@ -305,6 +327,16 @@ def load_config(config_dir: str | Path) -> tuple[GatewayConfig, list[str]]:
         for raw in fb.get("rules", ())
     )
 
+    cal = _read_yaml(d / "calibration.yaml")
+    if prefill := cal.get("prefill"):
+        cfg.calibration = CalibrationConfig(
+            const_ms=float(prefill["const_ms"]),
+            per_token_ms=float(prefill["per_token_ms"]),
+            quadratic_ms=float(prefill["quadratic_ms"]),
+            measured=True,
+            mean_rel_err=float((cal.get("quality") or {}).get("mean_rel_err", 0.0)),
+        )
+
     return cfg, validate(cfg)
 
 
@@ -368,6 +400,19 @@ def validate(cfg: GatewayConfig) -> list[str]:
         )
     if not 0 < adm.ewma_alpha <= 1:
         issues.append(f"ewma_alpha={adm.ewma_alpha} вне (0, 1]")
+
+    # Роутер на неоткалиброванной модели принимает решения, которые
+    # выглядят обоснованными, но ничем не обоснованы (§3.3.6.7a).
+    if not cfg.calibration.measured and cfg.router.strategy in ("dualmap",):
+        issues.append(
+            "стратегия dualmap опирается на оценку TTFT, а модель префилла не "
+            "откалибрована: запустите loadtest/calibrate.py"
+        )
+    if cfg.calibration.measured and cfg.calibration.mean_rel_err > 0.25:
+        issues.append(
+            f"калибровка низкого качества: средняя относительная ошибка "
+            f"{cfg.calibration.mean_rel_err:.0%}; оценкам TTFT доверять нельзя"
+        )
 
     known = {"least_load", "consistent_hash", "session", "dualmap"}
     if cfg.router.strategy not in known:
