@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import time
 from dataclasses import dataclass, field
 from typing import AsyncIterator
@@ -28,6 +29,11 @@ from typing import AsyncIterator
 from ..upstream.adapter import StreamEvent, UpstreamResponse
 
 log = logging.getLogger(__name__)
+
+# Сколько служебных кадров копить, прежде чем отдать их клиенту, не
+# дождавшись содержимого. Предел нужен против апстрима, который шлёт
+# метаданные бесконечно: иначе буфер растёт молча.
+MAX_STARTUP_FRAMES = 64
 
 
 @dataclass(slots=True)
@@ -89,6 +95,7 @@ class StreamPipeline:
         started_at: float,
         upstream_started_at: float | None = None,
         degraded_notice: dict | None = None,
+        guard: "RetryGuard | None" = None,
     ) -> AsyncIterator[bytes]:
         """Основной цикл. Генератор: отдаёт байты клиенту по мере
         поступления, ничего не буферизуя целиком.
@@ -103,31 +110,55 @@ class StreamPipeline:
         last_token_at = 0.0
         emitted = 0
 
-        try:
-            # Пометка деградации идёт первым кадром, до содержимого.
-            # Клиент не должен молча получать ответ другой модели —
-            # для банковского контура это обязательное требование (§3.3.8).
+        # Буфер стартовых кадров.
+        #
+        # Стрим начинается со служебных кадров — роль ассистента,
+        # идентификатор ответа, метаданные запуска. Содержимого в них нет,
+        # и если апстрим упадёт сразу после них, попытку можно повторить
+        # на другом. Но кадры, уже отданные клиенту, отозвать нельзя:
+        # после переподключения он получил бы служебные кадры обеих
+        # попыток, включая два кадра с ролью.
+        #
+        # Поэтому начало стрима копится в буфере и уходит клиенту вместе
+        # с первым кадром содержимого — то есть в момент, когда стало
+        # ясно, что эта попытка и есть окончательная. Буфер неудачной
+        # попытки просто отбрасывается.
+        #
+        # Приём взят из Bifrost (Apache-2.0), где стартовые метаданные
+        # буферизуются ровно для того, чтобы ошибка после них ещё могла
+        # попасть в логику повторов.
+        startup: list[bytes] = []
+        released = False
+
+        def flush() -> list[bytes]:
+            """Отдаёт накопленное начало стрима вместе с пометкой деградации."""
+            nonlocal released
+            released = True
+            out: list[bytes] = []
             if degraded_notice is not None:
+                # Пометка идёт перед содержимым: клиент не должен молча
+                # получать ответ другой модели (§3.3.8).
                 result.degraded = True
                 result.degraded_reason = degraded_notice.get("reason", "")
-                yield b"data: " + json.dumps(
+                out.append(b"data: " + json.dumps(
                     degraded_notice, ensure_ascii=False, separators=(",", ":")
-                ).encode() + b"\n\n"
+                ).encode() + b"\n\n")
+            out.extend(startup)
+            startup.clear()
+            return out
 
+        try:
             async for ev in response.events:
                 now = time.monotonic()
+                if guard is not None:
+                    # Граница повторов сдвигается здесь, а не у потребителя:
+                    # только тут видно, есть ли в кадре содержимое.
+                    guard.observe_event(ev)
                 if ev.kind == "usage":
                     # Провайдер сообщил точный расход — он надёжнее нашей
                     # оценки, по нему и корректируем квоту.
                     result.prompt_tokens = ev.prompt_tokens or result.prompt_tokens
                     result.completion_tokens = ev.completion_tokens or result.completion_tokens
-                    yield ev.raw
-                    continue
-
-                if ev.kind == "done":
-                    result.finished = True
-                    yield ev.raw
-                    continue
 
                 if ev.content:
                     if not emitted:
@@ -138,10 +169,33 @@ class StreamPipeline:
                     emitted += 1
                     last_token_at = now
 
-                if ev.finish_reason:
+                if ev.finish_reason or ev.kind == "done":
                     result.finished = True
 
-                yield ev.raw
+                if released:
+                    yield ev.raw
+                    continue
+
+                # Содержимое, конец потока или расход токенов означают,
+                # что начало стрима состоялось и его пора отдать.
+                if ev.content or ev.kind in ("done", "usage") or ev.finish_reason:
+                    for chunk in flush():
+                        yield chunk
+                    yield ev.raw
+                    continue
+
+                startup.append(ev.raw)
+                # Предохранитель: апстрим, бесконечно шлющий служебные
+                # кадры, не должен копиться в памяти молча.
+                if len(startup) > MAX_STARTUP_FRAMES:
+                    for chunk in flush():
+                        yield chunk
+
+            if not released and startup:
+                # Поток кончился, не дав ни одного кадра содержимого.
+                # Отдаём накопленное: клиент должен увидеть хоть что-то.
+                for chunk in flush():
+                    yield chunk
 
             if self._count_locally and not result.completion_tokens:
                 result.completion_tokens = emitted
@@ -213,23 +267,56 @@ _pending_closes: set[asyncio.Task] = set()
 class RetryGuard:
     """Граница, за которой повтор запрещён (§3.3.8).
 
-    Вынесено в отдельный объект нарочно: это правило легко нарушить,
-    добавив ретрай в другом месте цепочки, и тогда клиент получит
-    дубликат посреди уже начатого ответа.
+    Вынесено в отдельный объект нарочно: правило легко нарушить, добавив
+    ретрай в другом месте цепочки, и тогда клиент получит дубликат
+    посреди уже начатого ответа.
+
+    **Где именно проходит граница** — тонкость, которую пришлось
+    исправлять. Стрим начинается со служебных кадров: роль ассистента,
+    идентификатор ответа, у некоторых провайдеров — метаданные запуска.
+    Содержимого в них нет, клиент по ним ничего не увидел, и повтор в
+    этот момент совершенно безопасен.
+
+    Первая версия помечала границу по **любому** отданному кадру, из-за
+    чего отказ сразу после кадра с ролью делал деградацию невозможной,
+    хотя терять было нечего. Граница проходит по первому кадру
+    **с содержимым**.
+
+    Идея взята из Bifrost (Apache-2.0), где стартовые метаданные
+    буферизуются именно для того, чтобы ошибка, пришедшая после них,
+    ещё могла попасть в логику повторов.
     """
 
-    first_token_sent: bool = False
+    first_content_sent: bool = False
     attempts: int = 0
     max_attempts: int = 2
 
     def may_retry(self) -> bool:
-        return (not self.first_token_sent) and self.attempts < self.max_attempts
+        return (not self.first_content_sent) and self.attempts < self.max_attempts
 
     def mark_attempt(self) -> None:
         self.attempts += 1
 
-    def mark_first_token(self) -> None:
-        self.first_token_sent = True
+    def observe_event(self, event: StreamEvent) -> None:
+        """Сдвигает границу только на кадре с содержимым."""
+        if event.content:
+            self.first_content_sent = True
+
+    def backoff_s(self, *, initial: float = 0.2, maximum: float = 5.0,
+                  retry_after_s: float | None = None) -> float:
+        """Задержка перед следующей попыткой.
+
+        Если апстрим назвал время сам — берём его: он знает, когда
+        сдвинется окно квоты, а мы только догадываемся.
+
+        Иначе экспоненциальная задержка с джиттером. Джиттер обязателен:
+        без него все запросы, отвалившиеся одновременно, повторятся тоже
+        одновременно и создадут вторую волну ровно той же формы.
+        """
+        if retry_after_s is not None:
+            return min(retry_after_s, maximum)
+        base = min(initial * (2 ** max(0, self.attempts - 1)), maximum)
+        return base * random.uniform(0.8, 1.2)
 
 
 def degradation_notice(

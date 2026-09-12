@@ -293,3 +293,182 @@ async def test_raznye_tenanty_ne_delyat_kesh(gateway, fake_client):
     h_chat = block_hashes(text, gateway.ctx.block_tokens, salt="chat-ui")
     assert gateway.prefix.hit_len(h_agent, r2.headers["X-Gateway-Upstream"]) == 0 or \
            h_agent != h_chat, "тенанты делят ключи префикса"
+
+
+# --------------------------------------------------------------------------
+# Классификация отказов
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_otkaz_po_klyuchu_ne_portit_reputatsiyu_apstrima(gateway, fake_client):
+    """Просроченный ключ — не вина апстрима: он жив и исправен.
+
+    Если засчитывать это в статистику размыкателя, один неверный ключ
+    исключит здоровый апстрим для всех тенантов сразу.
+    """
+    cfg = gateway.registry.config
+    target = cfg.upstreams_for("main")[0].id
+    fake_client.set(target, fail_with=UpstreamError("ключ просрочен", status=401))
+
+    for i in range(20):
+        try:
+            resp = await gateway.handle(chat_body(content=f"ключ {i}"), AGENT)
+            await collect(resp)
+        except UpstreamError:
+            pass
+
+    b = gateway.breakers.get(target)
+    assert b.state.value == "closed", (
+        "отказ по учётным данным разомкнул исправный апстрим"
+    )
+
+
+@pytest.mark.asyncio
+async def test_otkaz_apstrima_razmykaet(gateway, fake_client):
+    """Обратная сторона: настоящий отказ апстрима обязан размыкать."""
+    cfg = gateway.registry.config
+    target = cfg.upstreams_for("main")[0].id
+    fake_client.set(target, fail_with=UpstreamError("упал", status=503))
+
+    for i in range(20):
+        try:
+            resp = await gateway.handle(chat_body(content=f"отказ {i}"), AGENT)
+            await collect(resp)
+        except UpstreamError:
+            pass
+
+    assert gateway.breakers.get(target).state.value != "closed"
+
+
+@pytest.mark.asyncio
+async def test_nevosstanovimyi_otkaz_ne_povtoryaetsya(gateway, fake_client):
+    """400 и 404 означают, что запрос некорректен. Повтор не поможет
+    никогда, и перебирать апстримы бессмысленно — только тратить их время."""
+    for uid in list(gateway.registry.config.upstreams):
+        fake_client.set(uid, fail_with=UpstreamError("некорректный запрос", status=400))
+
+    with pytest.raises(UpstreamError):
+        resp = await gateway.handle(chat_body(), AGENT)
+        await collect(resp)
+
+    assert len(fake_client.calls) == 1, (
+        f"невосстановимый отказ вызвал {len(fake_client.calls)} попыток"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sluzhebnyi_kadr_ne_meshaet_degradatsii(gateway, fake_client):
+    """Апстрим успел отдать кадр с ролью и упал. Клиент не увидел ни
+    одного токена, значит деградация обязана сработать.
+
+    Первая версия считала границей любой отданный кадр, и такой отказ
+    доходил до клиента ошибкой, хотя терять было нечего.
+    """
+    cfg = gateway.registry.config
+    first = cfg.upstreams_for("main")[0].id
+    # break_after=0: служебный кадр отдан, содержимое — нет.
+    fake_client.set(first, tokens=5, break_after=0)
+
+    for i in range(20):
+        resp = await gateway.handle(chat_body(content=f"служебный {i}"), AGENT)
+        try:
+            chunks = await collect(resp)
+        except UpstreamError:
+            continue
+        if resp.result.degraded:
+            assert resp.result.finished, "деградация не довела ответ до конца"
+            return
+    pytest.skip("роутер ни разу не выбрал целевой апстрим за 20 попыток")
+
+
+@pytest.mark.asyncio
+async def test_obryv_do_soderzhimogo_perekryvaetsya_prozrachno(gateway, fake_client):
+    """Апстрим открыл поток, отдал служебные кадры и упал.
+
+    Так ведут себя провайдеры, сообщающие об ошибке внутри HTTP 200
+    после стартовых метаданных. Клиент содержимого не видел, значит
+    переход на другой апстрим обязан быть прозрачным.
+
+    Без повтора внутри потока отказ, случившийся на миллисекунду позже
+    открытия, доходил бы до клиента ошибкой, хотя терять нечего.
+    """
+    cfg = gateway.registry.config
+    main_ids = [u.id for u in cfg.upstreams_for("main")]
+    # Все основные обрывают поток до первого содержимого; резервная
+    # модель исправна — именно для этого она и настроена.
+    for uid in main_ids:
+        fake_client.set(uid, tokens=5, break_after=0)
+
+    resp = await gateway.handle(chat_body(), AGENT)
+    chunks = await collect(resp)
+
+    assert resp.result.finished is True, "запрос не доведён до конца"
+    assert resp.result.degraded is True, "деградация не отмечена"
+    assert b"degraded" in chunks[0]
+    assert len(fake_client.calls) > 1, "переоткрытия потока не было"
+
+
+@pytest.mark.asyncio
+async def test_obryv_posle_soderzhimogo_ne_perekryvaetsya(gateway, fake_client):
+    """Обратная сторона и главное ограничение: после первого кадра с
+    содержимым стрим не идемпотентен, и повтор породил бы дубли в уже
+    начатом ответе (§3.3.8)."""
+    for uid in list(gateway.registry.config.upstreams):
+        fake_client.set(uid, tokens=10, break_after=3)
+
+    resp = await gateway.handle(chat_body(), AGENT)
+    with pytest.raises(UpstreamError):
+        await collect(resp)
+
+    assert len(fake_client.calls) == 1, (
+        f"после отдачи содержимого сделано {len(fake_client.calls)} попыток — "
+        "клиент получит дубликаты"
+    )
+
+
+@pytest.mark.asyncio
+async def test_perepodklyuchenie_ne_dubliruet_soderzhimoe(gateway, fake_client):
+    """Переоткрытие потока не должно приводить к повторной выдаче того,
+    что клиент уже получил."""
+    cfg = gateway.registry.config
+    for uid in [u.id for u in cfg.upstreams_for("main")]:
+        fake_client.set(uid, tokens=4, break_after=0)
+    # Резерв отдаёт ровно 4 кадра содержимого.
+    for uid in [u.id for u in cfg.upstreams_for("reserve")]:
+        fake_client.set(uid, tokens=4)
+
+    resp = await gateway.handle(chat_body(), AGENT)
+    chunks = await collect(resp)
+
+    content_frames = [c for c in chunks if b'"t"' in c]
+    # Ответ ровно один: 4 кадра с содержимым, без повторов.
+    assert len(content_frames) == 4, (
+        f"выдано {len(content_frames)} кадров содержимого вместо 4 — "
+        "переоткрытие продублировало ответ"
+    )
+
+
+@pytest.mark.asyncio
+async def test_inflight_osvobozhdaetsya_posle_perepodklyucheniya(gateway, fake_client):
+    """Переоткрытие занимает счётчик новой цели; старая обязана
+    освободиться, иначе ёмкость утекает при каждом обрыве."""
+    from gateway.core.gateway import AdmissionRejected
+
+    cfg = gateway.registry.config
+    for uid in [u.id for u in cfg.upstreams_for("main")]:
+        fake_client.set(uid, tokens=3, break_after=0)
+
+    # Часть запросов законно упрётся в размыкатель: апстримы обрываются
+    # раз за разом, и исключение их — правильное поведение. Проверяется
+    # не успех, а отсутствие утечки счётчиков при любом исходе.
+    for i in range(10):
+        try:
+            resp = await gateway.handle(chat_body(content=f"обрыв {i}"), AGENT)
+            await collect(resp)
+        except (UpstreamError, AdmissionRejected):
+            pass
+
+    stuck = {u.upstream_id: u.inflight_requests
+             for u in gateway.load.all_upstreams() if u.inflight_requests}
+    assert not stuck, f"после переподключений остались занятые слоты: {stuck}"

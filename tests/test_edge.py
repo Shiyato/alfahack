@@ -229,15 +229,60 @@ def test_proval_probnogo_zaprosa_snova_razmykaet():
 # --------------------------------------------------------------------------
 
 
-def test_retrai_zapreshchen_posle_pervogo_tokena():
-    """После первого токена стрим не идемпотентен: повтор породит дубли
-    в уже начатом ответе (§3.3.8). Тонкость, которую большинство
-    реализаций забывает."""
+def test_retrai_zapreshchen_posle_pervogo_soderzhimogo():
+    """После первого токена с содержимым стрим не идемпотентен: повтор
+    породит дубли в уже начатом ответе (§3.3.8)."""
     g = RetryGuard(max_attempts=3)
     g.mark_attempt()
     assert g.may_retry() is True
-    g.mark_first_token()
+    g.observe_event(StreamEvent(kind="delta", content="привет"))
     assert g.may_retry() is False
+
+
+def test_sluzhebnye_kadry_ne_zakryvayut_vozmozhnost_povtora():
+    """Стрим начинается со служебных кадров: роль ассистента,
+    идентификатор ответа, метаданные запуска. Содержимого в них нет,
+    клиент по ним ничего не увидел — повтор безопасен.
+
+    Первая версия помечала границу по любому отданному кадру, из-за чего
+    отказ сразу после кадра с ролью делал деградацию невозможной, хотя
+    терять было нечего.
+    """
+    g = RetryGuard(max_attempts=3)
+    g.mark_attempt()
+    g.observe_event(StreamEvent(kind="delta", content="", raw=b'{"role":"assistant"}'))
+    g.observe_event(StreamEvent(kind="delta", content=""))
+    assert g.may_retry() is True, "служебный кадр закрыл возможность повтора"
+
+    g.observe_event(StreamEvent(kind="delta", content="первое слово"))
+    assert g.may_retry() is False
+
+
+def test_zaderzhka_povtora_rastet_i_imeet_dzhitter():
+    """Без джиттера все запросы, отвалившиеся одновременно, повторятся
+    тоже одновременно и создадут вторую волну той же формы."""
+    g = RetryGuard(max_attempts=5)
+    g.mark_attempt()
+    first = [g.backoff_s(initial=0.2, maximum=5.0) for _ in range(50)]
+    g.mark_attempt()
+    g.mark_attempt()
+    later = [g.backoff_s(initial=0.2, maximum=5.0) for _ in range(50)]
+
+    assert len(set(first)) > 1, "джиттера нет: задержка детерминирована"
+    assert sum(later) / len(later) > sum(first) / len(first), (
+        "задержка не растёт с числом попыток"
+    )
+    assert all(v <= 5.0 for v in later), "задержка превысила потолок"
+
+
+def test_zaderzhka_beretsya_iz_zagolovka_apstrima():
+    """Апстрим знает, когда у него сдвинется окно квоты, а мы только
+    догадываемся. Прямое указание всегда лучше эвристики."""
+    g = RetryGuard(max_attempts=3)
+    g.mark_attempt()
+    assert g.backoff_s(retry_after_s=1.5) == 1.5
+    # Но не дольше потолка: апстрим может назвать час.
+    assert g.backoff_s(retry_after_s=3600.0, maximum=5.0) == 5.0
 
 
 def test_retrai_ogranichen_chislom_popytok():

@@ -17,6 +17,7 @@ import json
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, AsyncIterator
 
 import aiohttp
@@ -26,15 +27,60 @@ from ..core.domain import ChatRequest, Upstream
 log = logging.getLogger(__name__)
 
 
+class FailureKind(str, Enum):
+    """Природа отказа определяет, что с ним делать.
+
+    Различие взято из Bifrost (Apache-2.0) и закрывает пробел: у нас был
+    один флаг `retryable`, из-за чего исчерпанная квота апстрима и
+    упавший процесс лечились одинаково, хотя лечатся по-разному.
+
+    • CREDENTIAL — проблема в ключе или счёте (401/402/403). Ждать
+      бессмысленно: мёртвый ключ от ожидания не оживёт. Нужно менять
+      ключ или апстрим немедленно, без задержки.
+    • RATE_LIMIT — квота исчерпана (429). Смена ключа помогает не всегда:
+      квота часто общая на аккаунт. Поэтому смена **с задержкой**, и
+      задержку апстрим обычно сам называет в заголовке.
+    • TRANSIENT — упал апстрим (5xx, сеть, DNS). Тот же ключ, повтор с
+      экспоненциальной задержкой и джиттером.
+    • PERMANENT — запрос некорректен (400, 404, 422). Повтор не поможет
+      никогда, отдаём клиенту как есть.
+    """
+
+    CREDENTIAL = "credential"
+    RATE_LIMIT = "rate_limit"
+    TRANSIENT = "transient"
+    PERMANENT = "permanent"
+
+
+def classify(status: int | None) -> FailureKind:
+    if status is None:
+        return FailureKind.TRANSIENT          # сеть, DNS, обрыв соединения
+    if status in (401, 402, 403):
+        return FailureKind.CREDENTIAL
+    if status == 429:
+        return FailureKind.RATE_LIMIT
+    if status >= 500:
+        return FailureKind.TRANSIENT
+    return FailureKind.PERMANENT
+
+
 class UpstreamError(Exception):
     """Ошибка обращения к апстриму, пригодная для решения о деградации."""
 
     def __init__(self, message: str, *, status: int | None = None,
-                 retryable: bool = False, upstream_id: str = "") -> None:
+                 retryable: bool | None = None, upstream_id: str = "",
+                 retry_after_s: float | None = None) -> None:
         super().__init__(message)
         self.status = status
-        self.retryable = retryable
         self.upstream_id = upstream_id
+        self.kind = classify(status)
+        # Сколько ждать перед повтором, если апстрим сам это сказал.
+        # Собственная эвристика всегда хуже прямого указания источника.
+        self.retry_after_s = retry_after_s
+        self.retryable = (
+            retryable if retryable is not None
+            else self.kind is not FailureKind.PERMANENT
+        )
 
 
 class UpstreamTimeout(UpstreamError):
@@ -55,6 +101,47 @@ class StreamEvent:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     finish_reason: str | None = None
+
+
+def parse_retry_after(headers: dict[str, str]) -> float | None:
+    """Через сколько апстрим разрешает повторить.
+
+    Заголовок стандартный (RFC 9110) и допускает две формы — секунды или
+    дату. Некоторые провайдеры отдают миллисекунды отдельным заголовком,
+    что точнее для наших масштабов времени.
+
+    Смысл в том, чтобы **брать задержку у источника, а не угадывать**:
+    апстрим знает, когда у него сдвинется окно квоты, а мы нет. Идея из
+    Bifrost, где cooldown размыкателя читается прямо из заголовка.
+    """
+    lowered = {k.lower(): v for k, v in headers.items()}
+
+    for name in ("retry-after-ms", "x-ratelimit-reset-after-ms"):
+        if (raw := lowered.get(name)) is not None:
+            try:
+                return max(0.0, float(raw) / 1000.0)
+            except ValueError:
+                pass
+
+    for name in ("retry-after", "x-ratelimit-reset-after"):
+        if (raw := lowered.get(name)) is None:
+            continue
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            # Форма с датой: "Wed, 21 Oct 2026 07:28:00 GMT"
+            try:
+                from email.utils import parsedate_to_datetime
+                import datetime as _dt
+
+                when = parsedate_to_datetime(raw)
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=_dt.timezone.utc)
+                delta = (when - _dt.datetime.now(_dt.timezone.utc)).total_seconds()
+                return max(0.0, delta)
+            except Exception:
+                continue
+    return None
 
 
 class Adapter(ABC):
@@ -245,14 +332,14 @@ class UpstreamClient:
 
         if resp.status >= 400:
             body = (await resp.read())[:2048]
+            retry_after = parse_retry_after(dict(resp.headers))
             resp.release()
             raise UpstreamError(
                 f"апстрим {upstream.id} ответил {resp.status}: "
                 f"{body.decode('utf-8', 'ignore')}",
                 status=resp.status,
-                # Восстановимые коды: имеет смысл повторить или деградировать.
-                retryable=resp.status in (429, 500, 502, 503, 504),
                 upstream_id=upstream.id,
+                retry_after_s=retry_after,
             )
 
         async def events() -> AsyncIterator[StreamEvent]:

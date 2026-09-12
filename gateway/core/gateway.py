@@ -53,7 +53,12 @@ from ..stream.pipeline import (
     degradation_notice,
 )
 from ..telemetry import metrics as m
-from ..upstream.adapter import UpstreamClient, UpstreamError, get_adapter
+from ..upstream.adapter import (
+    FailureKind,
+    UpstreamClient,
+    UpstreamError,
+    get_adapter,
+)
 from .config import GatewayConfig
 from .domain import ChatRequest, ServiceClass, Upstream
 from .registry import ConfigRegistry
@@ -343,8 +348,17 @@ class Gateway:
         healthy_ids = set(self.breakers.healthy([u.id for u in candidates]))
         healthy = [u for u in candidates if u.id in healthy_ids]
         if not healthy:
+            # Если апстримы сами назвали время восстановления, отдаём его
+            # клиенту вместо выдуманной константы: наша оценка заведомо
+            # хуже, чем прямое указание источника.
+            hints = [
+                self.load.upstream(u.id).retry_after_s
+                for u in candidates
+                if self.load.upstream(u.id).retry_after_s
+            ]
             raise AdmissionRejected("все апстримы модели исключены размыкателем",
-                                    retry_after_s=5.0, limit_kind="all_open")
+                                    retry_after_s=min(hints) if hints else 5.0,
+                                    limit_kind="all_open")
 
         qreq = QueuedRequest(
             service_class=sc, tenant_id=request.tenant.id,
@@ -376,94 +390,178 @@ class Gateway:
         self, request: ChatRequest, upstream: Upstream, cfg: GatewayConfig,
         result: StreamResult, started: float, settle, budget_ms: float,
     ) -> GatewayResponse:
-        guard = RetryGuard(max_attempts=cfg.resilience.max_attempts)
-        attempt_upstream = upstream
-        notice = None
-        last_error: Exception | None = None
+        """Отправляет запрос и возвращает поток клиенту.
 
+        Повтор возможен в двух местах, и это не дублирование логики, а
+        два разных момента отказа:
+
+        1. **При открытии потока** — апстрим отказал сразу (4xx/5xx, сеть).
+        2. **Внутри уже открытого потока, до первого содержимого** — поток
+           открылся, пришли служебные кадры, и только потом отказ. Так
+           ведут себя провайдеры, сообщающие об ошибке внутри HTTP 200
+           после стартовых метаданных.
+
+        Второй случай важен и неочевиден: без него отказ, случившийся на
+        миллисекунду позже, доходит до клиента ошибкой, хотя терять
+        нечего — содержимого он ещё не видел. Первая версия обрабатывала
+        только первый случай.
+
+        Граница в обоих случаях одна: первый кадр **с содержимым**. После
+        него стрим не идемпотентен, и повтор породил бы дубли (§3.3.8).
+        """
+        guard = RetryGuard(max_attempts=cfg.resilience.max_attempts)
+        opened = await self._open_with_retry(
+            request, upstream, cfg, guard, started
+        )
+
+        async def body() -> AsyncIterator[bytes]:
+            response, target, notice = opened
+            try:
+                while True:
+                    u_load = self.load.upstream(target.id)
+                    try:  # noqa: PERF203
+                        async for chunk in self.pipeline.relay(
+                            response, result, started_at=started,
+                            upstream_started_at=time.monotonic(),
+                            degraded_notice=notice, guard=guard,
+                        ):
+                            yield chunk
+                        return
+                    except UpstreamError as exc:
+                        self._record_failure(target, exc, u_load, cfg)
+                        if not (exc.retryable and guard.may_retry()):
+                            raise
+                        nxt = self._fallback_target(request, cfg, exc, target)
+                        if nxt is None:
+                            raise
+                        # Ни одного кадра с содержимым отдано не было —
+                        # переоткрываем поток на другом апстриме прозрачно
+                        # для клиента.
+                        await self._wait_before_retry(exc, guard, cfg)
+                        m.retries_total.labels("mid_stream").inc()
+                        notice = degradation_notice(
+                            original_model=request.model, actual_model=nxt.model,
+                            reason=f"апстрим {target.id} оборвал поток: {exc}",
+                        )
+                        # Учёт занятости обязан быть симметричным: старая
+                        # цель освобождается ровно там, где новая
+                        # занимается. Иначе при каждом переподключении
+                        # у прежнего апстрима остаётся занятый слот, и
+                        # он постепенно выглядит перегруженным, не
+                        # обрабатывая ничего.
+                        self._release_one(request, target)
+                        target = nxt
+                        self._acquire_inflight(request, target)
+                        try:
+                            response = await self.client.open_stream(
+                                request, target, get_adapter(target.adapter)
+                            )
+                        except UpstreamError:
+                            self._release_one(request, target)
+                            raise
+                        self.strategy.on_dispatched(request, target, self.ctx)
+            except (GeneratorExit, asyncio.CancelledError):
+                result.client_disconnected = True
+                raise
+            finally:
+                self._release_one(request, target)
+                self._finish(request, result, self.breakers.get(target.id),
+                             budget_ms, started)
+                settle()
+
+        response, target, _ = opened
+        return GatewayResponse(
+            stream=body(),
+            result=result,
+            headers={
+                "X-Gateway-Request-Id": request.request_id,
+                "X-Gateway-Upstream": target.id,
+                "X-Gateway-Strategy": self.strategy.name,
+                "X-Gateway-Config-Version": str(cfg.version),
+            },
+        )
+
+    async def _open_with_retry(
+        self, request: ChatRequest, upstream: Upstream, cfg: GatewayConfig,
+        guard: RetryGuard, started: float,
+    ):
+        """Открывает поток, при необходимости перебирая цели."""
+        target = upstream
+        notice = None
         while True:
             guard.mark_attempt()
-            breaker = self.breakers.get(attempt_upstream.id)
-            adapter = get_adapter(attempt_upstream.adapter)
-            u_load = self.load.upstream(attempt_upstream.id)
-            u_load.inflight_requests += 1
-            u_load.inflight_tokens += request.prompt_tokens_est
-            m.inflight.labels(attempt_upstream.id).set(u_load.inflight_requests)
-            # Отсечка для расчёта накладных расходов: всё, что до неё, —
-            # наша работа, всё, что после, — работа апстрима.
-            upstream_started = time.monotonic()
-
+            u_load = self.load.upstream(target.id)
+            self._acquire_inflight(request, target)
             try:
-                response = await self.client.open_stream(request, attempt_upstream, adapter)
-            except UpstreamError as exc:
-                u_load.inflight_requests -= 1
-                u_load.inflight_tokens -= request.prompt_tokens_est
-                breaker.record_failure()
-                m.breaker_state.labels(attempt_upstream.id).set(
-                    m.BREAKER_CODES[breaker.state.value]
+                response = await self.client.open_stream(
+                    request, target, get_adapter(target.adapter)
                 )
-                if exc.status == 429:
-                    u_load.last_429_at = time.monotonic()
-                last_error = exc
-
-                # Повтор разрешён только до первого отданного токена:
-                # после него стрим не идемпотентен (§3.3.8).
-                target = self._fallback_target(request, cfg, exc, attempt_upstream)
-                if exc.retryable and guard.may_retry() and target is not None:
-                    m.retries_total.labels("fallback").inc()
-                    notice = degradation_notice(
-                        original_model=request.model,
-                        actual_model=target.model,
-                        reason=f"апстрим {attempt_upstream.id} недоступен: {exc}",
-                    )
-                    attempt_upstream = target
-                    continue
-                raise
-
-            self.strategy.on_dispatched(request, attempt_upstream, self.ctx)
-            self._record_prefix(request, attempt_upstream)
-
-            async def body() -> AsyncIterator[bytes]:
-                try:
-                    async for chunk in self.pipeline.relay(
-                        response, result, started_at=started,
-                        upstream_started_at=upstream_started, degraded_notice=notice
-                    ):
-                        if not guard.first_token_sent:
-                            guard.mark_first_token()
-                        yield chunk
-                except (GeneratorExit, asyncio.CancelledError):
-                    # Отмечаем разрыв здесь, а не полагаемся на то, что это
-                    # успеет сделать вложенный `relay`.
-                    #
-                    # Причина в порядке выполнения: блок `finally` вложенного
-                    # генератора выполняется асинхронно, уже после того, как
-                    # отработает `finally` этого. То есть `_finish` ниже
-                    # прочитал бы флаг разрыва раньше, чем `relay` успел его
-                    # выставить, и запрос попал бы в метрики как «неполный
-                    # ответ» — то есть как отказ апстрима. Клиент, закрывший
-                    # вкладку, портил бы репутацию исправному апстриму.
-                    result.client_disconnected = True
+            except UpstreamError as exc:
+                self._release_one(request, target)
+                self._record_failure(target, exc, u_load, cfg)
+                nxt = self._fallback_target(request, cfg, exc, target)
+                if not (exc.retryable and guard.may_retry() and nxt is not None):
                     raise
-                finally:
-                    u_load.inflight_requests = max(0, u_load.inflight_requests - 1)
-                    u_load.inflight_tokens = max(
-                        0, u_load.inflight_tokens - request.prompt_tokens_est
-                    )
-                    m.inflight.labels(attempt_upstream.id).set(u_load.inflight_requests)
-                    self._finish(request, result, breaker, budget_ms, started)
-                    settle()
+                await self._wait_before_retry(exc, guard, cfg)
+                m.retries_total.labels("fallback").inc()
+                notice = degradation_notice(
+                    original_model=request.model, actual_model=nxt.model,
+                    reason=f"апстрим {target.id} недоступен: {exc}",
+                )
+                target = nxt
+                continue
 
-            return GatewayResponse(
-                stream=body(),
-                result=result,
-                headers={
-                    "X-Gateway-Request-Id": request.request_id,
-                    "X-Gateway-Upstream": attempt_upstream.id,
-                    "X-Gateway-Strategy": self.strategy.name,
-                    "X-Gateway-Config-Version": str(cfg.version),
-                },
-            )
+            self.strategy.on_dispatched(request, target, self.ctx)
+            self._record_prefix(request, target)
+            return response, target, notice
+
+    def _acquire_inflight(self, request: ChatRequest, target: Upstream) -> None:
+        u = self.load.upstream(target.id)
+        u.inflight_requests += 1
+        u.inflight_tokens += request.prompt_tokens_est
+        m.inflight.labels(target.id).set(u.inflight_requests)
+
+    def _release_one(self, request: ChatRequest, target: Upstream) -> None:
+        u = self.load.upstream(target.id)
+        u.inflight_requests = max(0, u.inflight_requests - 1)
+        u.inflight_tokens = max(0, u.inflight_tokens - request.prompt_tokens_est)
+        m.inflight.labels(target.id).set(u.inflight_requests)
+
+    def _record_failure(self, target: Upstream, exc: UpstreamError,
+                        u_load, cfg: GatewayConfig) -> None:
+        """Учитывает отказ по его природе (§3.3.8).
+
+        Отказ по учётным данным не засчитывается размыкателю: апстрим жив
+        и исправен, у нас неверный ключ. Иначе один просроченный ключ
+        исключил бы здоровый апстрим для всех тенантов сразу.
+        """
+        breaker = self.breakers.get(target.id)
+        if exc.kind is not FailureKind.CREDENTIAL:
+            breaker.record_failure(hard=exc.kind is FailureKind.TRANSIENT)
+        m.breaker_state.labels(target.id).set(m.BREAKER_CODES[breaker.state.value])
+        if exc.kind is FailureKind.RATE_LIMIT:
+            u_load.last_429_at = time.monotonic()
+            u_load.retry_after_s = exc.retry_after_s
+        m.retries_total.labels(f"failure_{exc.kind.value}").inc()
+
+    async def _wait_before_retry(self, exc: UpstreamError, guard: RetryGuard,
+                                 cfg: GatewayConfig) -> None:
+        """Пауза перед следующей попыткой.
+
+        Мёртвый ключ от ожидания не оживёт, поэтому смена цели при отказе
+        по учётным данным идёт немедленно. Исчерпанная квота и упавший
+        апстрим требуют паузы: иначе повтор придётся на то же окно, что
+        и отказ.
+        """
+        if exc.kind is FailureKind.CREDENTIAL:
+            return
+        delay = guard.backoff_s(
+            initial=cfg.resilience.retry_backoff_initial_s,
+            maximum=cfg.resilience.retry_backoff_max_s,
+            retry_after_s=exc.retry_after_s,
+        )
+        if delay > 0:
+            await asyncio.sleep(delay)
 
     def _fallback_target(
         self, request: ChatRequest, cfg: GatewayConfig, exc: UpstreamError,
@@ -476,10 +574,15 @@ class Gateway:
         обязано явно подтвердить независимость ёмкости — валидатор
         конфигурации это требует.
         """
-        if exc.status is not None:
-            rule = cfg.fallback_for(request.model, exc.status)
+        # У обрыва соединения или потока кода ответа нет, но по существу
+        # это отказ апстрима. Сопоставляем такие случаи с правилами как
+        # 503: иначе настроенная резервная модель не сработает именно
+        # там, где она нужнее всего — когда апстрим умер молча.
+        status = exc.status if exc.status is not None else 503
+        if True:
+            rule = cfg.fallback_for(request.model, status)
             if rule is not None:
-                if exc.status == 429 and not rule.independent_capacity:
+                if status == 429 and not rule.independent_capacity:
                     return None
                 for target in rule.targets:
                     for u in cfg.upstreams_for(target):

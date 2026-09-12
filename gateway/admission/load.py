@@ -82,6 +82,10 @@ class UpstreamLoad:
     observed_ttft_ms: EWMA = field(default_factory=lambda: EWMA(alpha=0.2))
     error_rate: EWMA = field(default_factory=lambda: EWMA(alpha=0.2))
     last_429_at: float = 0.0
+    # Время восстановления, названное самим апстримом в заголовке
+    # Retry-After. Точнее любой нашей эвристики: апстрим знает, когда
+    # сдвинется окно его квоты.
+    retry_after_s: float | None = None
 
     # --- Прямые, если апстрим их отдаёт ---
     pending_prefill_tokens: int | None = None
