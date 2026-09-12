@@ -34,6 +34,7 @@ type opts struct {
 	Model        string
 	JSONOut      string
 	Salt         string
+	Auth         string
 }
 
 func main() {
@@ -52,6 +53,7 @@ func main() {
 	// прогон, и повтор тех же промптов измеряет тёплый кэш, а не систему.
 	// Пустая соль означает «взять текущее время», то есть всегда холодный кэш.
 	flag.StringVar(&o.Salt, "salt", "", "префикс, разделяющий прогоны по кэшу апстрима")
+	flag.StringVar(&o.Auth, "auth", "", "значение заголовка Authorization (для гейтвея)")
 	flag.Parse()
 	if o.Salt == "" {
 		o.Salt = fmt.Sprintf("r%d", time.Now().UnixNano())
@@ -186,6 +188,9 @@ func one(ctx context.Context, client *http.Client, o *opts, i int64) sample {
 		return s
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if o.Auth != "" {
+		req.Header.Set("Authorization", o.Auth)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
