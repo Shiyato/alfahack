@@ -295,6 +295,17 @@ def test_dualmap_pri_ravnom_popadanii_beret_menee_zagruzhennyi():
     assert "менее загруженный" in d.reason
 
 
+def warm_all(strategy, ups, ctx) -> None:
+    """Отмечает все апстримы прогретыми.
+
+    Нужно там, где проверяется правило выбора, а не прогревочная гарантия:
+    холодный кандидат забирает запрос вне очереди и маскирует проверяемое
+    поведение.
+    """
+    if hasattr(strategy, "_warmed"):
+        strategy._warmed.update(u.id for u in ups)
+
+
 def test_dualmap_derzhit_affinity_poka_ukladyvaetsya_v_slo():
     """Правило DualMap, а не Min TTFT: поштучная минимизация осциллирует
     между cache-aware и load-aware решениями (§3.3.6.3)."""
@@ -304,6 +315,7 @@ def test_dualmap_derzhit_affinity_poka_ukladyvaetsya_v_slo():
 
     d1 = s.select(req, ups, ctx)
     s.on_dispatched(req, d1.upstream, ctx)
+    warm_all(s, ups, ctx)
 
     # Кэширующий кандидат слегка загружен, но в пределах SLO.
     ctx.load.upstream(d1.upstream.id).pending_prefill_tokens = 500
@@ -318,6 +330,7 @@ def test_dualmap_degradiruet_v_load_aware_pri_narushenii_slo():
     req = make_request(turns=2)
     d1 = s.select(req, ups, ctx)
     s.on_dispatched(req, d1.upstream, ctx)
+    warm_all(s, ups, ctx)
 
     # Прогноз TTFT кэширующего кандидата уходит далеко за бюджет.
     ctx.load.upstream(d1.upstream.id).pending_prefill_tokens = 5_000_000

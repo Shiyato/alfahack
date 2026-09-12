@@ -272,6 +272,10 @@ class DualMapStrategy(RoutingStrategy):
 
     name = "dualmap"
 
+    def __init__(self) -> None:
+        # Апстримы, которые уже обслужили хотя бы один запрос.
+        self._warmed: set[str] = set()
+
     def select(self, request, candidates, ctx) -> RoutingDecision:
         n = len(candidates)
         if n == 1:
@@ -288,6 +292,24 @@ class DualMapStrategy(RoutingStrategy):
             # Кандидатов всегда ровно два — иначе теряется весь смысл P2C.
             i2 = (i1 + 1) % n
         c1, c2 = candidates[i1], candidates[i2]
+
+        # Прогревочная гарантия. Без неё апстрим, начавший с пустым кэшем,
+        # голодает вечно: попадание у него всегда нулевое, поэтому он
+        # проигрывает любому кандидату с прогретым кэшем, поэтому кэш у
+        # него так и не появляется. Замкнутый круг.
+        #
+        # Дефект нашёлся измерением распределения: при 8 апстримах один
+        # получил 0 запросов из 400. Особенно вреден он при эластичности
+        # (§3.3.6.5): инстанс, добавленный при масштабировании, приходит
+        # холодным и без этой гарантии не получит трафика вовсе — то есть
+        # масштабирование не работает именно тогда, когда оно нужно.
+        #
+        # Гарантия разовая: получив первый запрос, апстрим приобретает
+        # общий системный префикс и дальше конкурирует на общих правилах.
+        cold = [c for c in (c1, c2) if c.id not in self._warmed]
+        if cold and len(cold) < 2:
+            return RoutingDecision(upstream=cold[0], reason="прогрев холодного апстрима",
+                                   strategy=self.name, candidates_considered=2)
 
         hit1 = ctx.prefix.hit_len(hashes, c1.id) if hashes else 0
         hit2 = ctx.prefix.hit_len(hashes, c2.id) if hashes else 0
@@ -318,6 +340,7 @@ class DualMapStrategy(RoutingStrategy):
                                strategy=self.name, candidates_considered=2)
 
     def on_dispatched(self, request, upstream, ctx) -> None:
+        self._warmed.add(upstream.id)
         tenant_id = request.tenant.id if request.tenant else "anon"
         hashes = block_hashes(request.prompt_text(), ctx.block_tokens, salt=tenant_id)
         if hashes:

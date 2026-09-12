@@ -91,8 +91,18 @@ class UpstreamSim:
     uid: str
     capacity_tokens_per_s: float
     cache_blocks: int = 600            # ёмкость KV-кэша в блоках
+    # Декодирование: занятость, не зависящая от кэша. Без неё модель
+    # неверна — см. пояснение в `load()`.
+    # Спрос декодирования: 182 токена на запрос x 60 запросов/с / 4 апстрима
+    # = 2730 токенов/с на апстрим. Ёмкость 3000 ставит его у колена, как и
+    # префилл. Обе стадии обязаны быть у колена одновременно: если одна
+    # перегружена кратно, очереди у всех апстримов одинаково огромны, CV
+    # обращается в ноль и выглядит идеальной балансировкой.
+    decode_capacity_tokens_per_s: float = 3000.0
+    output_tokens: int = 182           # агентская трасса, §5.1
     cache: "OrderedDict[bytes, None]" = field(default_factory=OrderedDict)
     pending_tokens: float = 0.0
+    pending_decode: float = 0.0
     served: int = 0
     served_tokens: int = 0
     evicted: int = 0
@@ -116,22 +126,54 @@ class UpstreamSim:
         while len(self.cache) > self.cache_blocks:
             self.cache.popitem(last=False)
             self.evicted += 1
+        self.pending_decode += self.output_tokens
         self.served += 1
         self.served_tokens += prompt_tokens
         return hit, compute
 
+    def load(self) -> float:
+        """Наблюдаемая нагрузка апстрима.
+
+        Считает и префилл, и декодирование. Учитывать только префилл
+        нельзя, и это не мелочь: попадание в кэш обнуляет префилл, но не
+        отменяет генерацию ответа. В модели без декодирования апстрим с
+        полным кэшем выглядит бесконечно ёмким, и least-load сваливает
+        на него всё.
+
+        Так и вышло при первом прогоне: 2087 запросов из 2589 на один
+        апстрим из четырёх. Механизм — положительная обратная связь:
+        лучший кэш → нулевая нагрузка → выигрыш в least-load → ещё
+        больше трафика → ещё лучший кэш. В модели это выглядело
+        оптимальным, в реальности означало бы, что один инстанс тянет
+        80% нагрузки.
+        """
+        return self.pending_tokens + self.pending_decode
+
     def drain(self, dt: float) -> None:
         self.pending_tokens = max(0.0, self.pending_tokens - self.capacity_tokens_per_s * dt)
+        self.pending_decode = max(
+            0.0, self.pending_decode - self.decode_capacity_tokens_per_s * dt
+        )
 
 
-# Ёмкость откалибрована так, чтобы интенсивность 40 запросов/с давала
-# загрузку около колена насыщения. Замер на низкой загрузке показал бы,
-# что все стратегии одинаковы, и обесценил бы сравнение (§3.3.6.3d).
-# Расчёт: средняя длина входа 5031 токенов, при 93% попаданий вычислять
-# надо ~350 токенов на запрос, при 40 запросах/с — 14000 токенов/с на
-# кластер, то есть 3500 на апстрим.
+# Ёмкость подобрана по ИЗМЕРЕННОМУ спросу, а не по прикидке.
+#
+# Прикидка «средняя длина входа 5031 токен, при 93% попаданий считать надо
+# ~350 токенов» давала 3500 токенов/с на апстрим и оказалась завышенной
+# в шесть раз: замер показал 42 токена на запрос. Причина в том, что
+# попадание считается по блокам и промах сосредоточен в хвосте — каждый
+# следующий ход сессии дописывает лишь один обмен, а вся предыдущая
+# история уже в кэше.
+#
+# Измеренный спрос худшей стратегии (least_load): 110 667 токенов на
+# 2589 запросов при 60 запросах/с = 2565 токенов/с на кластер, то есть
+# ~640 на апстрим. Ёмкость 700 ставит её у колена насыщения, а более
+# удачные стратегии получают запас — что и требуется измерить.
+#
+# Замер на пустой системе показал бы CV, равный ровно нулю у всех, и это
+# выглядело бы идеальной балансировкой. На деле это отсутствие нагрузки.
 def run_strategy(strategy, *, n_upstreams=4, n_sessions=400, arrival_per_s=40.0,
-                 capacity=3800.0, cache_blocks=600, seed=7) -> dict:
+                 capacity=700.0, cache_blocks=600, seed=7) -> dict:
     rnd = random.Random(seed)
     ups = [UpstreamSim(f"u{i}", capacity, cache_blocks=cache_blocks)
            for i in range(n_upstreams)]
@@ -160,7 +202,7 @@ def run_strategy(strategy, *, n_upstreams=4, n_sessions=400, arrival_per_s=40.0,
 
         # Синхронизируем взгляд роутера с состоянием инстансов.
         for u in ups:
-            est.upstream(u.uid).pending_prefill_tokens = int(u.pending_tokens)
+            est.upstream(u.uid).pending_prefill_tokens = int(u.load())
 
         decision = strategy.select(req, upstreams, ctx)
         target = by_id[decision.upstream.id]
@@ -174,7 +216,7 @@ def run_strategy(strategy, *, n_upstreams=4, n_sessions=400, arrival_per_s=40.0,
         for u in ups:
             u.drain(dt)
         if processed > 200:      # прогрев исключаем (§5.1)
-            load_samples.append([u.pending_tokens for u in ups])
+            load_samples.append([u.load() for u in ups])
 
         if s.turn >= s.turns_total:
             active.remove(s)
