@@ -62,8 +62,9 @@ uv run uvicorn gateway.app:app --host 127.0.0.1 --port 8080 \
 ### Проверки
 
 ```bash
-uv run pytest tests/ -q          # 175 тестов
-(cd mock-upstream && go test ./...)  # 10 контрольных опытов стенда
+uv run pytest tests/ -q          # 195 тестов
+(cd mock-upstream && go test ./...)     # 10 контрольных опытов мока
+(cd loadtest/bench && go test ./...)    # 10 проверок профиля нагрузки
 loadtest/e2e.sh                  # 16 сквозных проверок
 ```
 

@@ -43,12 +43,19 @@ type SessionProfile struct {
 	ThinkTimeMs   int // пауза между ходами
 }
 
+// DefaultSessionProfile подобран так, чтобы средняя длина входа совпала
+// с агентской трассой: 8596 входных токенов (§5.1).
+//
+// Числа не назначены, а выведены: первая версия профиля давала средний
+// вход 4004 токена — вдвое меньше трассы. Поскольку время префилла растёт
+// суперлинейно, такой профиль систематически занижал нагрузку и смещал
+// колено насыщения. Проверяется тестом TestDlinaVhodaSopostavimaSTrassoi.
 func DefaultSessionProfile() SessionProfile {
 	return SessionProfile{
-		SystemTokens:  2000,
-		FirstTurnMin:  500,
-		FirstTurnMax:  1500,
-		TurnTokens:    200,
+		SystemTokens:  2500,
+		FirstTurnMin:  1500,
+		FirstTurnMax:  4000,
+		TurnTokens:    300,
 		OutputTokens:  182, // средняя длина выхода агентской трассы, §5.1
 		LongTailRatio: 0.25,
 		ShortTurns:    2,

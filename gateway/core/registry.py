@@ -87,10 +87,11 @@ class ConfigRegistry:
         cfg, issues = load_config(self._dir)
         cfg.version = self._config.version + 1
         old = self._config
+        # Тот же порядок, что и в `_reload`: подписчики раньше подмены.
+        self._notify(old, cfg)
         self._config = cfg
         self._issues = issues
         self._snapshot_mtimes()
-        self._notify(old, cfg)
         return issues
 
     async def start(self) -> None:
@@ -163,6 +164,22 @@ class ConfigRegistry:
 
         old = self._config
         cfg.version = old.version + 1
+
+        # Порядок важен: сначала уведомляем подписчиков, затем подменяем
+        # ссылку на конфигурацию.
+        #
+        # Причина. Перечитывание идёт в отдельном потоке, а горячий путь
+        # продолжает работать. Если подменить ссылку первой, возникает
+        # окно, в котором запрос уже видит новую конфигурацию, но
+        # производные от неё объекты — стратегию роутинга, коэффициенты
+        # калибровки — ещё не пересобраны. Запрос обслужился бы старой
+        # стратегией, а в заголовке ответа стояла бы новая версия: такое
+        # расхождение почти невозможно диагностировать по метрикам.
+        #
+        # При обратном порядке подмена ссылки становится последним шагом:
+        # к моменту, когда запрос видит новую версию, всё производное от
+        # неё уже готово.
+        self._notify(old, cfg)
         self._config = cfg
         self._issues = issues
         self._reload_count += 1
@@ -172,7 +189,6 @@ class ConfigRegistry:
             log.warning("конфигурация v%d: %s", cfg.version, i)
         log.info("конфигурация перечитана: версия %d, апстримов %d, моделей %d",
                  cfg.version, len(cfg.upstreams), len(cfg.model_aliases))
-        self._notify(old, cfg)
 
     def _notify(self, old: GatewayConfig, new: GatewayConfig) -> None:
         for cb in self._subscribers:
