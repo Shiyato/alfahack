@@ -262,6 +262,14 @@ def test_pometka_degradatsii_yavnaya():
 # --------------------------------------------------------------------------
 
 
+async def _wait_until(cond, *, turns: int = 50) -> None:
+    """Крутит цикл событий, пока условие не выполнится."""
+    for _ in range(turns):
+        if cond():
+            return
+        await asyncio.sleep(0)
+
+
 def _fake_response(events: list[StreamEvent], closed: list[bool]):
     from gateway.core.domain import Upstream
 
@@ -311,6 +319,10 @@ async def test_otmena_klientom_zakryvaet_potok_k_apstrimu():
     await gen.__anext__()
     await gen.__anext__()
     await gen.aclose()          # клиент отвалился
+    # При отмене закрытие ставится задачей: блок finally закрываемого
+    # генератора выполняется асинхронно, уже после возврата из aclose().
+    # См. пояснение в pipeline.relay.
+    await _wait_until(lambda: closed == [True])
 
     assert closed == [True], "поток к апстриму остался открытым после разрыва"
     assert result.client_disconnected is True
@@ -412,3 +424,48 @@ def test_slomannye_apstrimy_ostayutsya_isklyuchennymi():
         reg.get(uid).record_failure(hard=True, now=now)
         reg.get(uid).record_failure(hard=True, now=now)
     assert reg.healthy(["u1", "u2"]) == [], "сломанные апстримы не исключены"
+
+
+@pytest.mark.asyncio
+async def test_otmena_cherez_vlozhennyi_generator():
+    """Отмена приходит двумя способами, и первая версия ловила только один.
+
+    Когда потребитель закрывает генератор напрямую, приходит
+    `GeneratorExit`. Но в реальной цепочке `relay` обёрнут в другой
+    генератор — ASGI отдаёт клиенту именно его, — и тогда вложенный
+    получает `CancelledError`.
+
+    Последствие дефекта было тихим: ёмкость освобождалась правильно, но
+    метрика разрывов всегда показывала ноль, а неполные ответы шли
+    размыкателю как отказы апстрима. То есть клиент, закрывший вкладку,
+    портил репутацию исправному апстриму.
+    """
+    closed: list[bool] = []
+    events = [StreamEvent(kind="delta", content=str(i), raw=b"x") for i in range(100)]
+    result = StreamResult()
+
+    async def wrapper():
+        # Ровно та обёртка, что стоит в gateway.py.
+        async for chunk in StreamPipeline().relay(
+            _fake_response(events, closed), result, started_at=0.0
+        ):
+            yield chunk
+
+    gen = wrapper()
+    await gen.__anext__()
+    await gen.__anext__()
+    await gen.aclose()
+    # Закрытие происходит через несколько оборотов цикла: вложенному
+    # генератору нужен оборот, чтобы дойти до своего finally (оно
+    # выполняется асинхронно, уже после возврата из aclose()), и ещё
+    # один — чтобы отработала запланированная там задача. Точное число
+    # оборотов — деталь реализации asyncio, поэтому ждём по условию,
+    # а не угадываем константу.
+    await _wait_until(lambda: closed == [True])
+
+    assert closed == [True], "поток к апстриму остался открытым"
+    assert result.client_disconnected is True, (
+        "разрыв через вложенный генератор не опознан — он придёт как "
+        "CancelledError, а не GeneratorExit"
+    )
+    assert result.goodput_counted is False

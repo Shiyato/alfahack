@@ -470,6 +470,9 @@ class Gateway:
         labels = (sc.value, request.model)
 
         if result.client_disconnected:
+            # Разрыв клиентом не является отказом апстрима и не должен
+            # влиять на размыкатель: иначе закрытая вкладка портит
+            # репутацию исправному апстриму.
             m.client_disconnects.labels(sc.value).inc()
             m.requests_total.labels(*labels, "disconnected").inc()
             return

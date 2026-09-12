@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -340,11 +342,42 @@ def load_config(config_dir: str | Path) -> tuple[GatewayConfig, list[str]]:
     return cfg, validate(cfg)
 
 
+# ${VAR} и ${VAR:-значение по умолчанию}
+_ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+def expand_env(text: str) -> str:
+    """Подстановка переменных окружения в текст конфигурации.
+
+    Один и тот же файл должен работать и локально, и в контейнере, где
+    апстримы доступны под именами сервисов, а не по localhost. Без
+    подстановки пришлось бы держать две копии конфига, которые неизбежно
+    разъедутся.
+
+    Значение по умолчанию обязательно там, где оно осмысленно: конфиг
+    должен запускаться без единой переменной окружения, иначе локальная
+    разработка превращается в обряд.
+    """
+
+    def repl(m: re.Match[str]) -> str:
+        name, default = m.group(1), m.group(2)
+        value = os.environ.get(name)
+        if value is not None:
+            return value
+        if default is not None:
+            return default
+        log.warning("переменная окружения %s не задана и не имеет значения "
+                    "по умолчанию; подставлена пустая строка", name)
+        return ""
+
+    return _ENV_RE.sub(repl, text)
+
+
 def _read_yaml(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     with path.open(encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+        return yaml.safe_load(expand_env(f.read())) or {}
 
 
 # --------------------------------------------------------------------------

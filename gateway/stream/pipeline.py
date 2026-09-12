@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -97,6 +98,7 @@ class StreamPipeline:
         закрыть поток к апстриму.
         """
         result.upstream_id = response.upstream.id
+        cancelled = False
         first_token_at = 0.0
         last_token_at = 0.0
         emitted = 0
@@ -144,20 +146,67 @@ class StreamPipeline:
             if self._count_locally and not result.completion_tokens:
                 result.completion_tokens = emitted
 
-        except (GeneratorExit, Exception) as exc:
+        except BaseException as exc:
+            cancelled = True
             # Клиент отвалился или упал апстрим — в обоих случаях поток
             # к апстриму обязан закрыться, иначе генерация продолжится
             # в пустоту.
-            if isinstance(exc, GeneratorExit):
+            #
+            # Отмена приходит сюда двумя способами, и различать их нужно.
+            # Когда потребитель закрывает генератор напрямую, приходит
+            # GeneratorExit. Но в реальной цепочке `relay` обёрнут в другой
+            # генератор (ASGI отдаёт клиенту его), и тогда вложенный
+            # генератор получает **CancelledError**, а не GeneratorExit.
+            #
+            # Первая версия проверяла только GeneratorExit, и разрывы
+            # клиентом учитывались как «неполный ответ»: ёмкость
+            # освобождалась правильно, но метрика разрывов всегда была
+            # нулевой, а неполные ответы засчитывались размыкателю как
+            # отказы апстрима — то есть клиент, закрывший вкладку, портил
+            # репутацию исправному апстриму.
+            if isinstance(exc, (GeneratorExit, asyncio.CancelledError)):
                 result.client_disconnected = True
                 log.debug("клиент отключился, запрос к %s отменён", response.upstream.id)
             raise
         finally:
-            await response.close()
+            # Закрытие апстрима: способ зависит от того, как мы сюда попали.
+            #
+            # При нормальном завершении ждём обычным await — так закрытие
+            # гарантированно произошло к моменту возврата.
+            #
+            # При отмене ждать нельзя. Когда потребитель закрывает
+            # генератор, блок finally выполняется **асинхронно, уже после
+            # возврата из aclose()**, и любой await внутри него
+            # откладывается на неопределённый срок: поток к апстриму
+            # остаётся открытым, а брошенная генерация продолжает жечь
+            # ёмкость ровно так, как запрещает §3.3.9. Поэтому закрытие
+            # ставится задачей в цикл событий и выполняется независимо от
+            # судьбы текущей корутины.
+            if cancelled:
+                _schedule_close(response)
+            else:
+                await response.close()
             end = time.monotonic()
             result.total_ms = (end - started_at) * 1000.0
             if emitted > 1 and first_token_at and last_token_at > first_token_at:
                 result.itl_ms = (last_token_at - first_token_at) * 1000.0 / (emitted - 1)
+
+
+def _schedule_close(response: UpstreamResponse) -> None:
+    """Закрывает поток к апстриму, не завися от того, доживёт ли текущая
+    корутина до следующего await."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = loop.create_task(response.close())
+    # Ссылку держим до завершения: без неё сборщик мусора может забрать
+    # задачу раньше, чем она выполнится.
+    _pending_closes.add(task)
+    task.add_done_callback(_pending_closes.discard)
+
+
+_pending_closes: set[asyncio.Task] = set()
 
 
 @dataclass(slots=True)

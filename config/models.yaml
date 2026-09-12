@@ -1,16 +1,20 @@
 # Реестр моделей и апстримов (§3.3.7). Правится на ходу: hot-reload подхватит
 # изменение без передеплоя — это демо критерия «гибкость» (§1.2).
+#
+# Адреса подставляются из окружения: один и тот же файл работает локально
+# (по умолчанию — localhost) и в контейнере, где апстримы доступны под
+# именами сервисов. Две копии конфига неизбежно разъехались бы.
 
 upstreams:
   - id: mock-a
-    base_url: http://127.0.0.1:9001
+    base_url: ${MOCK_A_URL:-http://127.0.0.1:9001}
     model: mock-llm
     adapter: openai
     # state_url отдаёт pending_prefill_tokens и признак очереди. Доступен
     # только у self-hosted движка — сценарий 1 из §3.3.6.8. Если апстрим
     # непрозрачен, строку убираем, и роутер деградирует до наблюдаемых
     # сигналов, не ломаясь.
-    state_url: http://127.0.0.1:9001/state
+    state_url: ${MOCK_A_URL:-http://127.0.0.1:9001}/state
     timeout_connect_s: 5.0
     # Таймауты раздельные. Один общий — типичная ошибка: он либо режет
     # длинные легитимные ответы, либо не ловит зависший префилл (§3.3.8).
@@ -18,22 +22,22 @@ upstreams:
     timeout_total_s: 600.0
 
   - id: mock-b
-    base_url: http://127.0.0.1:9002
+    base_url: ${MOCK_B_URL:-http://127.0.0.1:9002}
     model: mock-llm
     adapter: openai
-    state_url: http://127.0.0.1:9002/state
+    state_url: ${MOCK_B_URL:-http://127.0.0.1:9002}/state
 
   - id: mock-c
-    base_url: http://127.0.0.1:9003
+    base_url: ${MOCK_C_URL:-http://127.0.0.1:9003}
     model: mock-llm
     adapter: openai
-    state_url: http://127.0.0.1:9003/state
+    state_url: ${MOCK_C_URL:-http://127.0.0.1:9003}/state
 
   - id: mock-slow
-    base_url: http://127.0.0.1:9004
+    base_url: ${MOCK_SLOW_URL:-http://127.0.0.1:9004}
     model: mock-llm
     adapter: openai
-    state_url: http://127.0.0.1:9004/state
+    state_url: ${MOCK_SLOW_URL:-http://127.0.0.1:9004}/state
 
 # Логическое имя модели → апстримы, которые её обслуживают.
 models:
