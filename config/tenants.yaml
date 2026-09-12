@@ -1,0 +1,39 @@
+# Виртуальные ключи → тенанты (§3.3.2).
+# Реальные ключи провайдеров не покидают гейтвей: отзыв доступа клиенту
+# не требует ротации провайдерских ключей.
+
+tenants:
+  - id: ide-agent
+    name: agent@bank
+    team: engineering
+    # Агентский класс: TTFT ослаблен, приоритет — пропускная способность (§2.1.3)
+    service_class: agent
+    keys: [sk-agent-demo]
+    allowed_models: [main, reserve]
+    tokens_per_minute: 2000000
+    requests_per_minute: 6000
+
+  - id: chat-ui
+    name: chat@bank
+    team: product
+    service_class: interactive
+    keys: [sk-chat-demo]
+    allowed_models: [main]
+    tokens_per_minute: 500000
+    requests_per_minute: 1200
+
+  - id: nightly-index
+    name: index@bank
+    team: data
+    service_class: batch
+    keys: [sk-batch-demo]
+    allowed_models: [main, reserve]
+    tokens_per_minute: 5000000
+    requests_per_minute: 20000
+
+  - id: warmup
+    name: warmup@bank
+    team: platform
+    service_class: background
+    keys: [sk-bg-demo]
+    allowed_models: [main]

@@ -1,0 +1,71 @@
+# Реестр моделей и апстримов (§3.3.7). Правится на ходу: hot-reload подхватит
+# изменение без передеплоя — это демо критерия «гибкость» (§1.2).
+
+upstreams:
+  - id: mock-a
+    base_url: http://127.0.0.1:9001
+    model: mock-llm
+    adapter: openai
+    # state_url отдаёт pending_prefill_tokens и признак очереди. Доступен
+    # только у self-hosted движка — сценарий 1 из §3.3.6.8. Если апстрим
+    # непрозрачен, строку убираем, и роутер деградирует до наблюдаемых
+    # сигналов, не ломаясь.
+    state_url: http://127.0.0.1:9001/state
+    timeout_connect_s: 5.0
+    # Таймауты раздельные. Один общий — типичная ошибка: он либо режет
+    # длинные легитимные ответы, либо не ловит зависший префилл (§3.3.8).
+    timeout_ttft_s: 30.0
+    timeout_total_s: 600.0
+
+  - id: mock-b
+    base_url: http://127.0.0.1:9002
+    model: mock-llm
+    adapter: openai
+    state_url: http://127.0.0.1:9002/state
+
+  - id: mock-c
+    base_url: http://127.0.0.1:9003
+    model: mock-llm
+    adapter: openai
+    state_url: http://127.0.0.1:9003/state
+
+  - id: mock-slow
+    base_url: http://127.0.0.1:9004
+    model: mock-llm
+    adapter: openai
+    state_url: http://127.0.0.1:9004/state
+
+# Логическое имя модели → апстримы, которые её обслуживают.
+models:
+  main: [mock-a, mock-b, mock-c]
+  reserve: [mock-slow]
+
+# Целевые показатели (§2.1.4). TTFT-SLO линейный по длине входа:
+# запрос на 100k токенов физически не ответит так же быстро, как на 500.
+# Коэффициенты — из калибровочного прогона, не из головы.
+slo:
+  ttft_base_ms: 500.0
+  ttft_per_token_ms: 0.05
+  tpot_ms: 30.0
+  relative_ttft_multiplier: 10.0
+  relative_tpot_multiplier: 5.0
+
+router:
+  # least_load | consistent_hash | session | dualmap — см. §3.3.6.3c.
+  # session выбран основным: он требует только номера хода, который
+  # извлекается из тела запроса, и потому работает при непрозрачном апстриме.
+  strategy: session
+  block_tokens: 256
+  prefix_ttl_s: 600.0
+  # Плато гиперпараметров SMetric широкое: TPS меняется в пределах 6%
+  # при OVERLOAD от 1 до бесконечности. Подбирать не нужно.
+  overload_factor: 2.0
+  hit_ratio_factor: 0.5
+
+admission:
+  max_queue_depth: 1000
+  # Демпферы контура раннего отклонения (§3.3.3.3). Без них — автоколебания.
+  ewma_alpha: 0.2
+  reject_threshold: 1.0
+  resume_threshold: 0.8
+  default_output_estimate: 512

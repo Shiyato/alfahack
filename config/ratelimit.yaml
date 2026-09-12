@@ -1,0 +1,44 @@
+# Квотирование (§3.3.3.5). Семантика — первое совпавшее правило, как в ACL.
+# ВНИМАНИЕ: порядок является частью семантики. Специфичные правила ставятся
+# выше общих; валидатор предупредит о недостижимых.
+#
+# Квоты режутся по токенам, а не только по запросам: запрос с контекстом на
+# 100k токенов и запрос на 200 нагружают систему на два порядка по-разному.
+# Пара «токены + запросы» нужна одновременно — токены ловят тяжёлые запросы,
+# счёт запросов ловит шквал лёгких.
+#
+# Алгоритм окна — token bucket: агентская нагрузка принципиально всплесковая,
+# агент выпускает серию запросов подряд по мере обхода инструментов, и
+# fixed window резал бы легитимные серии.
+
+rules:
+  - id: agent-main-generous
+    when:
+      subjects: ["team:engineering"]
+      models: ["main"]
+    tokens_per_minute: 2000000
+    requests_per_minute: 6000
+    max_concurrent: 512
+    burst_multiplier: 3.0
+
+  - id: interactive-protected
+    when:
+      service_classes: ["interactive"]
+    tokens_per_minute: 500000
+    requests_per_minute: 1200
+    max_concurrent: 128
+    burst_multiplier: 2.0
+
+  - id: batch-throttled
+    when:
+      service_classes: ["batch"]
+    tokens_per_minute: 5000000
+    requests_per_minute: 20000
+    max_concurrent: 64
+    burst_multiplier: 1.2
+
+  - id: default-catch-all
+    when: {}
+    tokens_per_minute: 100000
+    requests_per_minute: 600
+    max_concurrent: 32
