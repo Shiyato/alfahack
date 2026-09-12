@@ -16,6 +16,13 @@ __pycache__/
 /loadtest/results/
 *.local.json
 
+# Индекс CodeGraph: локален для машины, стареет при первой правке кода
+# и конфликтует при слиянии. В git живёт текстовая выгрузка —
+# docs/codegraph.md, см. tools/README.md. Сам каталог с его .gitignore
+# версионируется, чтобы репозиторий был помечен как индексируемый.
+.codegraph/*
+!.codegraph/.gitignore
+
 # Окружение
 .env
 .DS_Store
