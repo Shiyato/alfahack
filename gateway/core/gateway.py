@@ -42,7 +42,7 @@ from ..admission.queue import (
 )
 from ..admission.quota import QuotaLedger
 from ..auth.resolver import authorize_model, resolve
-from ..resilience.breaker import BreakerRegistry, BreakerState
+from ..resilience.breaker import BreakerConfig, BreakerRegistry, BreakerState
 from ..router.base import RoutingContext
 from ..router.prefix import PrefixTable, block_hashes, estimate_tokens
 from ..router.strategies import build_strategy
@@ -101,9 +101,13 @@ class Gateway:
 
         self.strategy = build_strategy(cfg.router)
         self.queue = PriorityQueue(max_depth=cfg.admission.max_queue_depth)
-        self.dispatcher = SelectiveDispatcher(self.queue)
+        self.dispatcher = SelectiveDispatcher(
+            self.queue,
+            max_wait_s=cfg.resilience.queue_max_wait_s,
+            poll_interval_s=cfg.resilience.queue_poll_interval_s,
+        )
         self.quotas = QuotaLedger()
-        self.breakers = BreakerRegistry()
+        self.breakers = BreakerRegistry(self._breaker_config(cfg))
         self.client = UpstreamClient()
         self.pipeline = StreamPipeline()
 
@@ -111,16 +115,30 @@ class Gateway:
         # о ней не знает и не должен (§3.1).
         registry.subscribe(self._on_config_change)
 
+    @staticmethod
+    def _breaker_config(cfg: GatewayConfig) -> BreakerConfig:
+        r = cfg.resilience
+        return BreakerConfig(
+            error_rate_threshold=r.error_rate_threshold,
+            min_samples=r.min_samples,
+            consecutive_failures_to_open=r.consecutive_failures_to_open,
+            latency_multiplier=r.latency_multiplier,
+            open_duration_s=r.open_duration_s,
+            half_open_successes=r.half_open_successes,
+            window_s=r.window_s,
+        )
+
     # ------------------------------------------------------------------
     # Жизненный цикл
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
         await self.client.start()
-        self._probe_task = asyncio.create_task(self._probe_loop(), name="upstream-probe")
+        r = self.registry.config.resilience
+        self._probe_task = asyncio.create_task(
+            self._probe_loop(r.probe_interval_s), name="upstream-probe")
         self._fairshare_task = asyncio.create_task(
-            self._fairshare_loop(), name="fairshare-reset"
-        )
+            self._fairshare_loop(r.fairshare_window_s), name="fairshare-reset")
 
     async def stop(self) -> None:
         for name in ("_probe_task", "_fairshare_task"):
@@ -137,6 +155,11 @@ class Gateway:
         if old.router.strategy != new.router.strategy:
             log.info("стратегия роутинга: %s → %s", old.router.strategy, new.router.strategy)
             self.strategy = build_strategy(new.router)
+        if old.resilience != new.resilience:
+            # Новая настройка применяется к вновь создаваемым размыкателям;
+            # существующие доживают на прежней, чтобы правка конфига не
+            # обнуляла накопленную статистику по живым апстримам.
+            self.breakers._cfg = self._breaker_config(new)
         self.ctx.slo = new.slo
         self.ctx.block_tokens = new.router.block_tokens
         if new.calibration.measured:
@@ -147,7 +170,7 @@ class Gateway:
     # Фоновые циклы
     # ------------------------------------------------------------------
 
-    async def _probe_loop(self, interval_s: float = 0.25) -> None:
+    async def _probe_loop(self, interval_s: float) -> None:
         """Опрос состояния апстримов.
 
         Частота выбрана не наугад: замер Б-2 показал, что устаревание
@@ -179,7 +202,9 @@ class Gateway:
         try:
             assert self.client._session is not None
             async with self.client._session.get(
-                upstream.state_url, timeout=aiohttp.ClientTimeout(total=1.0)
+                upstream.state_url,
+                timeout=aiohttp.ClientTimeout(
+                    total=self.registry.config.resilience.probe_timeout_s),
             ) as resp:
                 if resp.status != 200:
                     return
@@ -195,7 +220,7 @@ class Gateway:
         u.state_fresh_at = time.monotonic()
         m.inflight_tokens.labels(upstream.id).set(u.load_metric())
 
-    async def _fairshare_loop(self, interval_s: float = 10.0) -> None:
+    async def _fairshare_loop(self, interval_s: float) -> None:
         """Сброс окна fair-share.
 
         Без сброса счётчик обслуженных растёт вечно, и тенант, активный
@@ -351,7 +376,7 @@ class Gateway:
         self, request: ChatRequest, upstream: Upstream, cfg: GatewayConfig,
         result: StreamResult, started: float, settle, budget_ms: float,
     ) -> GatewayResponse:
-        guard = RetryGuard()
+        guard = RetryGuard(max_attempts=cfg.resilience.max_attempts)
         attempt_upstream = upstream
         notice = None
         last_error: Exception | None = None

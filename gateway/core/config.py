@@ -182,6 +182,49 @@ class AdmissionConfig:
 
 
 @dataclass(slots=True)
+class ResilienceConfig:
+    """Параметры устойчивости (§3.3.8).
+
+    Вынесены в конфигурацию, а не оставлены в коде, по конкретной причине:
+    поведение незнакомой платформы при отказах заранее неизвестно. Её
+    таймауты, коды ошибок и скорость восстановления выясняются только на
+    месте, и крутить их придётся быстро — правкой YAML, а не передеплоем.
+
+    Значения по умолчанию совпадают с проверенными в замерах Б-5 и Б-6.
+    """
+
+    # --- Размыкатель ---
+    error_rate_threshold: float = 0.5
+    min_samples: int = 20
+    # Серия отказов подряд — сигнал сильнее доли в окне: ждать статистики
+    # для явно мёртвого апстрима незачем, каждая попытка стоит таймаута.
+    consecutive_failures_to_open: int = 3
+    # Ответ во столько раз хуже бюджета считается отказом: успешный, но
+    # очень медленный апстрим вреднее честной пятисотки.
+    latency_multiplier: float = 5.0
+    open_duration_s: float = 10.0
+    half_open_successes: int = 3
+    window_s: float = 30.0
+
+    # --- Ретраи ---
+    # Повтор возможен только до первого отданного токена; это ограничение
+    # жёсткое и конфигом не снимается (§3.3.8).
+    max_attempts: int = 2
+
+    # --- Селективная отдача ---
+    queue_max_wait_s: float = 30.0
+    queue_poll_interval_s: float = 0.002
+
+    # --- Опрос состояния апстримов ---
+    # Замер Б-2: устаревание сигнала рушит admission control сильнее, чем
+    # отсутствие любых демпферов — доля запросов в SLO падала со 100% до
+    # 10%. Поэтому частота опроса здесь несущий параметр, а не деталь.
+    probe_interval_s: float = 0.25
+    probe_timeout_s: float = 1.0
+    fairshare_window_s: float = 10.0
+
+
+@dataclass(slots=True)
 class CalibrationConfig:
     """Коэффициенты модели времени префилла (§3.3.6.7a).
 
@@ -207,6 +250,7 @@ class GatewayConfig:
     slo: SLOConfig = field(default_factory=SLOConfig)
     router: RouterConfig = field(default_factory=RouterConfig)
     admission: AdmissionConfig = field(default_factory=AdmissionConfig)
+    resilience: ResilienceConfig = field(default_factory=ResilienceConfig)
     upstreams: dict[str, Upstream] = field(default_factory=dict)
     model_aliases: dict[str, tuple[str, ...]] = field(default_factory=dict)
     tenants: dict[str, Tenant] = field(default_factory=dict)
@@ -286,6 +330,8 @@ def load_config(config_dir: str | Path) -> tuple[GatewayConfig, list[str]]:
         cfg.router = RouterConfig(**router)
     if adm := models.get("admission"):
         cfg.admission = AdmissionConfig(**adm)
+    if res := models.get("resilience"):
+        cfg.resilience = ResilienceConfig(**res)
 
     auth = _read_yaml(d / "tenants.yaml")
     for raw in auth.get("tenants", ()):
@@ -446,6 +492,22 @@ def validate(cfg: GatewayConfig) -> list[str]:
             f"калибровка низкого качества: средняя относительная ошибка "
             f"{cfg.calibration.mean_rel_err:.0%}; оценкам TTFT доверять нельзя"
         )
+
+    r = cfg.resilience
+    if r.probe_interval_s > 2.0:
+        issues.append(
+            f"probe_interval_s={r.probe_interval_s} с: по замеру Б-2 устаревание "
+            "сигнала нагрузки рушит admission control сильнее, чем отсутствие "
+            "демпферов — доля запросов в SLO падает со 100% до 10%"
+        )
+    if r.half_open_successes < 1:
+        issues.append("half_open_successes должен быть не меньше 1, "
+                      "иначе размыкатель закроется на первом же пробном запросе")
+    if r.open_duration_s <= 0:
+        issues.append("open_duration_s должен быть положительным, "
+                      "иначе размыкатель не исключает апстрим вовсе")
+    if r.max_attempts < 1:
+        issues.append("max_attempts должен быть не меньше 1")
 
     known = {"least_load", "consistent_hash", "session", "dualmap"}
     if cfg.router.strategy not in known:

@@ -221,3 +221,43 @@ def test_konfig_repozitoriya_rabotaet_v_konteinere(monkeypatch):
     assert cfg.upstreams["mock-a"].base_url == "http://mock-a:9000"
     assert cfg.upstreams["mock-a"].state_url == "http://mock-a:9000/state"
     assert not issues
+
+
+# --------------------------------------------------------------------------
+# Параметры устойчивости
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_parametry_ustoichivosti_chitayutsya_iz_konfiga(registry):
+    """Поведение незнакомой платформы при отказах выясняется на месте.
+    Если параметры зашиты в коде, подстройка требует передеплоя."""
+    r = registry.config.resilience
+    assert r.consecutive_failures_to_open == 3
+    assert r.probe_interval_s == 0.25
+    assert r.max_attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_parametry_ustoichivosti_menyayutsya_na_hodu(registry, cfg_dir):
+    v = registry.config.version
+    text = (cfg_dir / "models.yaml").read_text()
+    (cfg_dir / "models.yaml").write_text(
+        text.replace("consecutive_failures_to_open: 3",
+                     "consecutive_failures_to_open: 7")
+    )
+    assert await wait_version(registry, v)
+    assert registry.config.resilience.consecutive_failures_to_open == 7
+
+
+def test_validator_predupredhaet_o_redkom_oprose():
+    """Замер Б-2: устаревание сигнала рушит admission control сильнее,
+    чем отсутствие любых демпферов. Редкий опрос — не настройка вкуса."""
+    from gateway.core.config import GatewayConfig, ResilienceConfig
+
+    cfg = GatewayConfig()
+    cfg.resilience = ResilienceConfig(probe_interval_s=10.0)
+    issues = validate(cfg)
+    assert any("probe_interval_s" in i for i in issues), (
+        "валидатор не предупредил о редком опросе апстримов"
+    )
