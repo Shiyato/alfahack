@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Go
+/mock-upstream/mockup
+/mock-upstream/mock-upstream
+/loadtest/bench/bench
+*.test
+
+# Результаты замеров: сырые прогоны не версионируем, в репозиторий
+# попадают только сведённые таблицы в docs/benchmarks.md
+/loadtest/results/
+*.local.json
+
+# Окружение
+.env
+.DS_Store
