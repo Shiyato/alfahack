@@ -115,22 +115,34 @@ class OpenAIAdapter(Adapter):
             obj = json.loads(payload)
         except (ValueError, UnicodeDecodeError):
             return None
+        if not isinstance(obj, dict):
+            # Валидный JSON, но не объект: `null`, `[]`, строка, число.
+            # Апстрим не обязан присылать только то, что мы ожидаем, а
+            # исключение здесь роняет весь стрим — один странный кадр
+            # обрывает нормально идущую генерацию.
+            return None
 
         raw = b"data: " + payload + b"\n\n"
-        if usage := obj.get("usage"):
+        usage = obj.get("usage")
+        if isinstance(usage, dict) and usage:
             return StreamEvent(
                 kind="usage", raw=raw,
                 prompt_tokens=int(usage.get("prompt_tokens") or 0),
                 completion_tokens=int(usage.get("completion_tokens") or 0),
             )
         choices = obj.get("choices") or []
-        if not choices:
+        if not isinstance(choices, list) or not choices:
             return StreamEvent(kind="delta", raw=raw)
         choice = choices[0]
-        delta = choice.get("delta") or {}
+        if not isinstance(choice, dict):
+            return StreamEvent(kind="delta", raw=raw)
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            delta = {}
+        content = delta.get("content")
         return StreamEvent(
             kind="delta",
-            content=delta.get("content") or "",
+            content=content if isinstance(content, str) else "",
             raw=raw,
             finish_reason=choice.get("finish_reason"),
         )

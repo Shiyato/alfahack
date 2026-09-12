@@ -407,6 +407,19 @@ class Gateway:
                         if not guard.first_token_sent:
                             guard.mark_first_token()
                         yield chunk
+                except (GeneratorExit, asyncio.CancelledError):
+                    # Отмечаем разрыв здесь, а не полагаемся на то, что это
+                    # успеет сделать вложенный `relay`.
+                    #
+                    # Причина в порядке выполнения: блок `finally` вложенного
+                    # генератора выполняется асинхронно, уже после того, как
+                    # отработает `finally` этого. То есть `_finish` ниже
+                    # прочитал бы флаг разрыва раньше, чем `relay` успел его
+                    # выставить, и запрос попал бы в метрики как «неполный
+                    # ответ» — то есть как отказ апстрима. Клиент, закрывший
+                    # вкладку, портил бы репутацию исправному апстриму.
+                    result.client_disconnected = True
+                    raise
                 finally:
                     u_load.inflight_requests = max(0, u_load.inflight_requests - 1)
                     u_load.inflight_tokens = max(
