@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -343,3 +344,71 @@ async def test_pometka_degradatsii_idet_pervym_kadrom():
     assert b"degraded" in out[0]
     assert out[1] == "полезное".encode()
     assert result.degraded is True
+
+
+# --------------------------------------------------------------------------
+# Лавина размыкателей — дефект, найденный под нагрузкой
+# --------------------------------------------------------------------------
+
+
+def test_myagkii_otkaz_ne_schitaetsya_v_seriyu():
+    """Правило «три отказа подряд размыкают» задумано против явно
+    мёртвого апстрима. Применённое к неполным стримам, оно под нагрузкой
+    исключало живые апстримы: несколько оборванных ответов подряд —
+    обычное дело при перегрузке, а не признак поломки."""
+    b = CircuitBreaker("u", BreakerConfig(min_samples=100, consecutive_failures_to_open=3))
+    t = 1000.0
+    for i in range(10):
+        b.record_failure(hard=False, now=t + i)
+    assert b.state is BreakerState.CLOSED
+
+
+def test_zhestkii_otkaz_schitaetsya_v_seriyu():
+    b = CircuitBreaker("u", BreakerConfig(min_samples=100, consecutive_failures_to_open=3))
+    t = 1000.0
+    for i in range(3):
+        b.record_failure(hard=True, now=t + i)
+    assert b.state is BreakerState.OPEN
+
+
+def test_reestr_ne_ostavlyaet_sistemu_bez_apstrimov():
+    """Защита от лавины. Под общей перегрузкой медленными становятся все
+    апстримы сразу, размыкатели исключают всех, и деградация «медленно»
+    превращается в отказ «недоступно».
+
+    Перегрузка — работа admission control, а не размыкателя. Размыкатель
+    существует, чтобы обойти сломанный апстрим, а не чтобы выключить
+    сервис, когда нагрузка выше расчётной.
+    """
+    from gateway.resilience.breaker import BreakerRegistry
+
+    reg = BreakerRegistry(BreakerConfig(min_samples=3, latency_multiplier=2.0,
+                                        error_rate_threshold=0.5,
+                                        open_duration_s=60))
+    ids = ["u1", "u2", "u3"]
+    now = time.monotonic()
+    # Все отвечают успешно, но втрое медленнее бюджета.
+    for uid in ids:
+        for i in range(5):
+            reg.get(uid).record_success(latency_ms=3000, budget_ms=1000, now=now)
+
+    assert all(reg.get(u).state is BreakerState.OPEN for u in ids)
+    assert reg.healthy(ids), "все апстримы исключены за медлительность — это лавина"
+    assert set(reg.healthy(ids)) == set(ids)
+
+
+def test_slomannye_apstrimy_ostayutsya_isklyuchennymi():
+    """Обратная сторона: настоящие отказы обязаны исключать апстрим
+    насовсем, иначе защита бессмысленна."""
+    from gateway.resilience.breaker import BreakerRegistry
+
+    reg = BreakerRegistry(BreakerConfig(consecutive_failures_to_open=2,
+                                        open_duration_s=60))
+    # Настоящее время: healthy() спрашивает allows() без параметра, и
+    # фиктивные отметки дали бы «прошло много времени» и полуоткрытое
+    # состояние вместо разомкнутого.
+    now = time.monotonic()
+    for uid in ("u1", "u2"):
+        reg.get(uid).record_failure(hard=True, now=now)
+        reg.get(uid).record_failure(hard=True, now=now)
+    assert reg.healthy(["u1", "u2"]) == [], "сломанные апстримы не исключены"

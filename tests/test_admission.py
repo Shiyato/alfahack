@@ -323,3 +323,89 @@ def test_metrika_nagruzki_predpochitaet_pending_prefill():
     assert u.load_metric() == 500.0
     u.pending_prefill_tokens = 12000
     assert u.load_metric() == 12000.0
+
+
+# --------------------------------------------------------------------------
+# Живая блокировка диспетчера — дефект, найденный под нагрузкой
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ozhidayushchii_zabiraet_tolko_svoi_zapros():
+    """Первая версия диспетчера вынимала из очереди голову и, если та
+    принадлежала другому, пыталась передать ей слот через future,
+    которого ни у кого не было. Чужой запрос терялся, а его корутина
+    продолжала крутиться.
+
+    Под нагрузкой это дало живую блокировку: 14 миллионов оборотов на
+    четыре тысячи запросов и среднее ожидание 30 секунд при полностью
+    свободных апстримах.
+    """
+    q = PriorityQueue()
+    disp = SelectiveDispatcher(q, max_wait_s=3.0, poll_interval_s=0.002)
+    ready = ["u1"]
+
+    reqs = [q_req(ServiceClass.AGENT, f"t{i}") for i in range(5)]
+    tasks = [asyncio.create_task(disp.acquire_slot(r, lambda: ready)) for r in reqs]
+    done = await asyncio.gather(*tasks)
+
+    assert len(done) == 5, "часть запросов потерялась"
+    assert len(q) == 0, "в очереди остались запросы после обслуживания всех"
+    stats = disp.stats()
+    assert stats["dispatched"] == 5
+    # Оборотов должно быть на порядки меньше числа запросов, а не наоборот.
+    assert stats["spins"] < 200, f"диспетчер крутится вхолостую: {stats['spins']} оборотов"
+
+
+@pytest.mark.asyncio
+async def test_prioritetnyi_zapros_obgonyaet_v_dispetchere():
+    """Приоритет обязан работать и в ожидании слота, а не только
+    в самой очереди."""
+    q = PriorityQueue()
+    disp = SelectiveDispatcher(q, max_wait_s=3.0, poll_interval_s=0.002)
+    ready: list[str] = []
+    order: list[str] = []
+
+    async def run(req, name):
+        await disp.acquire_slot(req, lambda: ready)
+        order.append(name)
+
+    batch = [asyncio.create_task(run(q_req(ServiceClass.BATCH, f"b{i}"), f"batch-{i}"))
+             for i in range(3)]
+    await asyncio.sleep(0.02)
+    inter = asyncio.create_task(
+        run(q_req(ServiceClass.INTERACTIVE, "human"), "interactive")
+    )
+    await asyncio.sleep(0.02)
+
+    ready.append("u1")
+    await asyncio.gather(*batch, inter)
+    assert order[0] == "interactive", f"интерактивный не обогнал батч: {order}"
+
+
+@pytest.mark.asyncio
+async def test_taimaut_ubiraet_zapros_iz_ocheredi():
+    """Брошенный запрос, оставшийся в очереди, дождётся своей очереди и
+    займёт слот апстрима, который уже никому не нужен."""
+    from gateway.admission.queue import QueueTimeout
+
+    q = PriorityQueue()
+    disp = SelectiveDispatcher(q, max_wait_s=0.05, poll_interval_s=0.002)
+    with pytest.raises(QueueTimeout):
+        await disp.acquire_slot(q_req(ServiceClass.AGENT, "t"), lambda: [])
+    assert len(q) == 0, "запрос остался в очереди после таймаута"
+
+
+@pytest.mark.asyncio
+async def test_otmena_ubiraet_zapros_iz_ocheredi():
+    q = PriorityQueue()
+    disp = SelectiveDispatcher(q, max_wait_s=5.0, poll_interval_s=0.002)
+    task = asyncio.create_task(
+        disp.acquire_slot(q_req(ServiceClass.AGENT, "t"), lambda: [])
+    )
+    await asyncio.sleep(0.02)
+    assert len(q) == 1
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert len(q) == 0, "отменённый запрос остался в очереди"

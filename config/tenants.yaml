@@ -10,8 +10,9 @@ tenants:
     service_class: agent
     keys: [sk-agent-demo]
     allowed_models: [main, reserve]
-    tokens_per_minute: 2000000
-    requests_per_minute: 6000
+    # Значения выведены из длины запроса, см. config/ratelimit.yaml.
+    tokens_per_minute: 105000000
+    requests_per_minute: 12000
 
   - id: chat-ui
     name: chat@bank
@@ -19,8 +20,8 @@ tenants:
     service_class: interactive
     keys: [sk-chat-demo]
     allowed_models: [main]
-    tokens_per_minute: 500000
-    requests_per_minute: 1200
+    tokens_per_minute: 80000000
+    requests_per_minute: 9000
 
   - id: nightly-index
     name: index@bank
@@ -28,8 +29,8 @@ tenants:
     service_class: batch
     keys: [sk-batch-demo]
     allowed_models: [main, reserve]
-    tokens_per_minute: 5000000
-    requests_per_minute: 20000
+    tokens_per_minute: 210000000
+    requests_per_minute: 24000
 
   - id: warmup
     name: warmup@bank

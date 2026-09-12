@@ -1,0 +1,21 @@
+# Шаг опроса 2 секунды — намеренно частый.
+#
+# Переходные процессы, которые мы показываем на защите, длятся секунды:
+# размыкание апстрима, всплеск очереди, деградация класса batch. На
+# стандартном шаге в 15 секунд они попадают в один-два отсчёта и на
+# графике неразличимы.
+
+global:
+  scrape_interval: 2s
+  evaluation_interval: 2s
+
+scrape_configs:
+  - job_name: gateway
+    static_configs:
+      - targets: ["gateway-1:8080", "gateway-2:8080"]
+    metrics_path: /metrics
+
+  - job_name: upstreams
+    static_configs:
+      - targets: ["mock-a:9000", "mock-b:9000", "mock-c:9000", "mock-slow:9000"]
+    metrics_path: /metrics

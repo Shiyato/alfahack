@@ -1,0 +1,102 @@
+# Весь стенд одной командой (§5).
+#
+#   docker compose -f deploy/docker-compose.yml up --build
+#
+# Что поднимается:
+#   • четыре мок-апстрима с разными характеристиками — чтобы роутинг
+#     и балансировка имели смысл, а не выбирали из одинаковых;
+#   • два экземпляра гейтвея за nginx — требование §3.3.8.1: прокси сам
+#     не должен быть единой точкой отказа;
+#   • Prometheus и Grafana с готовым дашбордом.
+
+name: llm-gateway
+
+services:
+  # --- Апстримы -------------------------------------------------------
+  # Характеристики разные нарочно. Одинаковые апстримы не позволяют
+  # увидеть ни работу роутера, ни перекос нагрузки.
+
+  mock-a:
+    build: ../mock-upstream
+    command: ["-addr", ":9000", "-id", "mock-a", "-itl", "8ms", "-concurrency", "8"]
+    ports: ["9001:9000"]
+    healthcheck:
+      test: ["CMD", "/mockup", "-h"]
+      interval: 10s
+      timeout: 2s
+
+  mock-b:
+    build: ../mock-upstream
+    command: ["-addr", ":9000", "-id", "mock-b", "-itl", "10ms", "-concurrency", "8"]
+    ports: ["9002:9000"]
+
+  mock-c:
+    build: ../mock-upstream
+    command: ["-addr", ":9000", "-id", "mock-c", "-itl", "12ms", "-concurrency", "6"]
+    ports: ["9003:9000"]
+
+  # Резервный: заметно медленнее и теснее. Годится как цель деградации,
+  # но не как равноправный участник балансировки.
+  mock-slow:
+    build: ../mock-upstream
+    command: ["-addr", ":9000", "-id", "mock-slow", "-itl", "25ms", "-concurrency", "4"]
+    ports: ["9004:9000"]
+
+  # --- Гейтвей --------------------------------------------------------
+  # Два экземпляра: убийство одного не должно ронять сервис (§3.3.8.1).
+  # Состояние маршрутизации мягкое — при потере экземпляра деградирует
+  # эффективность, но не корректность.
+
+  gateway-1: &gateway
+    build: ..
+    environment:
+      GATEWAY_CONFIG_DIR: /app/config
+      WORKERS: "2"
+    volumes:
+      # Конфиг смонтирован снаружи: демо hot-reload состоит в том, чтобы
+      # править файл на хосте и видеть эффект без передеплоя (§3.1.1).
+      - ../config:/app/config:ro
+    depends_on: [mock-a, mock-b, mock-c, mock-slow]
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/healthz')"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+
+  gateway-2:
+    <<: *gateway
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports: ["8080:8080"]
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on: [gateway-1, gateway-2]
+
+  # --- Наблюдаемость --------------------------------------------------
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    ports: ["9090:9090"]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      # Частый опрос: нас интересуют переходные процессы длиной в
+      # секунды — размыкание, всплеск очереди, деградация. На
+      # пятнадцатисекундном шаге они просто не видны.
+      - --storage.tsdb.retention.time=6h
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    ports: ["3000:3000"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: light
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on: [prometheus]

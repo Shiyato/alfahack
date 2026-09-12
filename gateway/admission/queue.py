@@ -108,6 +108,35 @@ class PriorityQueue:
         self._total += 1
         self._wake_one()
 
+    def _select(self) -> tuple[ServiceClass, str] | None:
+        """Какой запрос вышел бы следующим. Вынесено отдельно, чтобы
+        `peek` и `get_nowait` не разъезжались: правило выбора должно
+        быть одно."""
+        for cls in sorted(ServiceClass, key=lambda c: c.priority):
+            lanes = self._lanes[cls]
+            if not self._depth_by_class[cls]:
+                continue
+            best_tenant = min(
+                (t for t, d in lanes.items() if d),
+                key=lambda t: (self._served.get(t, 0), lanes[t][0].seq),
+            )
+            return cls, best_tenant
+        return None
+
+    def peek(self) -> QueuedRequest | None:
+        """Голова очереди без изъятия.
+
+        Нужна диспетчеру: ожидающий обязан убедиться, что следующий —
+        именно его запрос, прежде чем забирать слот. Забирать чужой и
+        пытаться его кому-то передать — верный способ потерять запрос
+        и устроить живую блокировку.
+        """
+        sel = self._select()
+        if sel is None:
+            return None
+        cls, tenant = sel
+        return self._lanes[cls][tenant][0]
+
     def get_nowait(self) -> QueuedRequest | None:
         for cls in sorted(ServiceClass, key=lambda c: c.priority):
             lanes = self._lanes[cls]
@@ -195,7 +224,16 @@ class SelectiveDispatcher:
 
     Поэтому признак — **бинарный и адаптивный**: занят ли апстрим прямо
     сейчас. Источник признака зависит от того, что нам видно (§3.3.6.8),
-    и подставляется извне функцией `is_ready`.
+    и подставляется извне функцией `ready_upstreams`.
+
+    **Каждый ожидающий забирает только свой запрос.** Первая версия
+    вынимала из очереди голову и, если та принадлежала другому, пыталась
+    передать ей слот через future, которого ни у кого не было. Чужой
+    запрос при этом терялся, а его собственная корутина продолжала
+    крутиться. Под нагрузкой это дало живую блокировку: 14 миллионов
+    оборотов на четыре тысячи запросов и среднее ожидание в очереди
+    30 секунд при пустых апстримах. Ожидающий обязан лишь **смотреть**
+    на голову очереди и забирать её, только если это он сам.
     """
 
     def __init__(
@@ -203,70 +241,67 @@ class SelectiveDispatcher:
         queue: PriorityQueue,
         *,
         max_wait_s: float = 30.0,
-        poll_interval_s: float = 0.005,
+        poll_interval_s: float = 0.002,
     ) -> None:
         self._queue = queue
         self._max_wait = max_wait_s
         self._poll = poll_interval_s
         self._dispatched = 0
         self._timed_out = 0
+        self._spins = 0
         self._wait_samples: list[float] = []
 
-    async def acquire_slot(
-        self,
-        req: QueuedRequest,
-        ready_upstreams,
-    ) -> tuple[Any, float]:
-        """Ждёт, пока появится готовый апстрим, и возвращает его.
+    async def acquire_slot(self, req: QueuedRequest, ready_upstreams):
+        """Ждёт, пока появится готовый апстрим И подойдёт очередь.
 
-        `ready_upstreams` — вызываемое, возвращающее список готовых
-        апстримов прямо сейчас. Передаётся снаружи, потому что источник
-        сигнала зависит от сценария видимости и не должен быть зашит
-        в диспетчер.
-
-        Запрос, который стоит в очереди, ещё не начал тратить ресурсы
-        апстрима — поэтому отказ здесь дёшев, а отказ после начала
-        обработки означал бы выброшенную работу (§2.1.2).
+        Запрос, стоящий в очереди, ещё не тратит ресурсы апстрима —
+        поэтому отказ здесь дёшев, а отказ после начала обработки
+        означал бы выброшенную работу (§2.1.2).
         """
         self._queue.put(req)
         deadline = time.monotonic() + self._max_wait
 
-        while True:
-            candidates = ready_upstreams()
-            if candidates:
-                head = self._queue.get_nowait()
-                if head is None:
-                    # Кто-то успел забрать раньше — возвращаемся в ожидание.
-                    await asyncio.sleep(self._poll)
-                    continue
-                if head is not req:
-                    # Вперёд нас прошёл более приоритетный: отдаём ему слот,
-                    # свой запрос возвращаем в очередь.
-                    self._queue.put(req)
-                    head_wait = head.waited_s
-                    self._dispatched += 1
-                    self._wait_samples.append(head_wait)
-                    if head.future and not head.future.done():
-                        head.future.set_result(candidates[0])
-                    await asyncio.sleep(0)
-                    continue
-                wait = req.waited_s
-                self._dispatched += 1
-                self._wait_samples.append(wait)
-                return candidates[0], wait
+        try:
+            while True:
+                if self._queue.peek() is req:
+                    candidates = ready_upstreams()
+                    if candidates:
+                        taken = self._queue.get_nowait()
+                        # Между peek и get никто не мог вклиниться:
+                        # обе операции синхронны и цикл событий их не
+                        # разрывает. Проверка — на случай будущих правок.
+                        if taken is not req:
+                            if taken is not None:
+                                self._queue.put(taken)
+                            await asyncio.sleep(0)
+                            continue
+                        wait = req.waited_s
+                        self._dispatched += 1
+                        self._wait_samples.append(wait)
+                        if len(self._wait_samples) > 2000:
+                            del self._wait_samples[:1000]
+                        return candidates[0], wait
 
-            if time.monotonic() >= deadline:
-                self._timed_out += 1
-                raise QueueTimeout(
-                    f"ни один апстрим не освободился за {self._max_wait} с"
-                )
-            await asyncio.sleep(self._poll)
+                if time.monotonic() >= deadline:
+                    self._timed_out += 1
+                    raise QueueTimeout(
+                        f"не дождались готового апстрима за {self._max_wait} с"
+                    )
+                self._spins += 1
+                await asyncio.sleep(self._poll)
+        except BaseException:
+            # Клиент отвалился или истекло время — запрос обязан покинуть
+            # очередь, иначе он дождётся своей очереди и займёт слот
+            # апстрима, который уже никому не нужен.
+            self._queue.remove(req)
+            raise
 
     def stats(self) -> dict[str, float]:
         samples = self._wait_samples[-1000:]
         return {
             "dispatched": self._dispatched,
             "timed_out": self._timed_out,
+            "spins": self._spins,
             "queue_wait_avg_ms": (sum(samples) / len(samples) * 1000) if samples else 0.0,
             "queue_wait_max_ms": (max(samples) * 1000) if samples else 0.0,
         }

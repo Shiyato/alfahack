@@ -85,6 +85,10 @@ class CircuitBreaker:
         self._half_open_ok = 0
         self._consecutive_failures = 0
         self._transitions = 0
+        # Почему разомкнут: "errors", "consecutive" или "latency".
+        # Различие нужно снаружи: медленный апстрим под общей перегрузкой
+        # всё же лучше, чем отсутствие апстрима вовсе.
+        self.open_reason = ""
 
     @property
     def state(self) -> BreakerState:
@@ -119,10 +123,9 @@ class CircuitBreaker:
         )
         if too_slow:
             self._window.add(False, now)
-            self._consecutive_failures += 1
             log.debug("апстрим %s: ответ за %.0f мс при бюджете %.0f мс — засчитан отказ",
                       self.upstream_id, latency_ms, budget_ms)
-            self._maybe_open(now)
+            self._maybe_open(now, reason="latency")
             return
 
         self._window.add(True, now)
@@ -133,10 +136,23 @@ class CircuitBreaker:
                 self._to(BreakerState.CLOSED)
                 self._window = _Window(window_s=self.cfg.window_s)
 
-    def record_failure(self, *, now: float | None = None) -> None:
+    def record_failure(self, *, hard: bool = True, now: float | None = None) -> None:
+        """Регистрирует отказ.
+
+        `hard` отличает отказ апстрима (соединение не установилось, пришёл
+        5xx) от неполного результата, у которого может быть множество
+        причин на нашей стороне — наш таймаут, отмена, разрыв в середине.
+
+        Различие не косметическое. Правило «три отказа подряд размыкают»
+        задумано против явно мёртвого апстрима, где каждая попытка стоит
+        таймаута соединения. Применённое к неполным стримам, оно под
+        нагрузкой исключало живые апстримы: несколько оборванных ответов
+        подряд — обычное дело при перегрузке, а не признак поломки.
+        """
         now = now if now is not None else time.monotonic()
         self._window.add(False, now)
-        self._consecutive_failures += 1
+        if hard:
+            self._consecutive_failures += 1
         if self._state is BreakerState.HALF_OPEN:
             # Пробный запрос провалился — снова размыкаем, не дожидаясь
             # накопления статистики.
@@ -144,19 +160,20 @@ class CircuitBreaker:
             return
         self._maybe_open(now)
 
-    def _maybe_open(self, now: float) -> None:
+    def _maybe_open(self, now: float, *, reason: str = "errors") -> None:
         if self._state is not BreakerState.CLOSED:
             return
         if self._consecutive_failures >= self.cfg.consecutive_failures_to_open:
-            self._open(now)
+            self._open(now, reason="consecutive")
             return
         total, rate = self._window.stats(now)
         if total >= self.cfg.min_samples and rate >= self.cfg.error_rate_threshold:
-            self._open(now)
+            self._open(now, reason=reason)
 
-    def _open(self, now: float) -> None:
+    def _open(self, now: float, *, reason: str = "errors") -> None:
         self._opened_at = now
         self._consecutive_failures = 0
+        self.open_reason = reason
         self._to(BreakerState.OPEN)
         log.warning("апстрим %s исключён на %.0f с", self.upstream_id,
                     self.cfg.open_duration_s)
@@ -175,6 +192,7 @@ class CircuitBreaker:
             "samples": total,
             "error_rate": round(rate, 3),
             "consecutive_failures": self._consecutive_failures,
+            "open_reason": self.open_reason,
             "transitions": self._transitions,
         }
 
@@ -192,7 +210,30 @@ class BreakerRegistry:
         return b
 
     def healthy(self, upstream_ids: list[str]) -> list[str]:
-        return [uid for uid in upstream_ids if self.get(uid).allows()]
+        """Апстримы, которым можно слать запросы.
+
+        **Никогда не возвращает пустой список, если хоть один апстрим
+        разомкнут лишь по латентности.** Это защита от лавины: под общей
+        перегрузкой медленными становятся все апстримы сразу, размыкатели
+        исключают всех, и деградация «медленно» превращается в отказ
+        «недоступно».
+
+        Перегрузка — это работа admission control (§3.3.3), а не
+        размыкателя. Размыкатель существует для того, чтобы обойти
+        *сломанный* апстрим, а не чтобы выключить сервис, когда нагрузка
+        выше расчётной. Механизмы, разумные по отдельности, вместе дают
+        лавину — это тот самый случай.
+        """
+        live = [uid for uid in upstream_ids if self.get(uid).allows()]
+        if live:
+            return live
+        # Все разомкнуты. Возвращаем тех, кто разомкнут только за
+        # медлительность: медленный ответ лучше пятисотки.
+        slow_only = [
+            uid for uid in upstream_ids
+            if self.get(uid).open_reason == "latency"
+        ]
+        return slow_only
 
     def snapshot(self) -> list[dict[str, object]]:
         return [b.snapshot() for b in self._breakers.values()]

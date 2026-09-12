@@ -1,0 +1,1232 @@
+{
+  "uid": "llm-gateway",
+  "title": "Высоконагруженный прокси для LLM",
+  "description": "Три графика защиты (§3.3.10) плюс диагностика роутера и control-plane.",
+  "tags": [
+    "llm",
+    "gateway"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "2s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 100,
+      "type": "row",
+      "title": "График 1. SLA по времени отклика (§3.3.10)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "collapsed": false
+    },
+    {
+      "id": 1,
+      "title": "TTFT по перцентилям",
+      "description": "Доказательство SLA. Суммарная latency для LLM бессмысленна — она пропорциональна длине ответа, которую мы не контролируем. Отзывчивость с точки зрения человека — это TTFT (§2.1).",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(gateway_ttft_seconds_bucket[30s])))",
+          "legendFormat": "p50",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(gateway_ttft_seconds_bucket[30s])))",
+          "legendFormat": "p95",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(gateway_ttft_seconds_bucket[30s])))",
+          "legendFormat": "p99",
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Интенсивность запросов",
+      "description": "Ось X для предыдущего графика: кривая «TTFT против RPS» строится их сопоставлением.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "targets": [
+        {
+          "expr": "sum by (service_class) (rate(gateway_requests_total[30s]))",
+          "legendFormat": "{{service_class}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Накладные расходы гейтвея",
+      "description": "Единственная метрика, за которую отвечаем мы (§2.1): наше время минус время апстрима. Бюджет — 5–20 мс. Если растёт, проблема в инфраструктуре, а не в модели.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 9
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(gateway_overhead_seconds_bucket[30s])))",
+          "legendFormat": "p95",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(gateway_overhead_seconds_bucket[30s])))",
+          "legendFormat": "p99",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Межтокенная задержка (ITL)",
+      "description": "Скорость печати. Рваный стрим человек замечает сразу — в отличие от лишней секунды ожидания первого токена (§2.1.1).",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 9
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (service_class,le) (rate(gateway_itl_seconds_bucket[30s])))",
+          "legendFormat": "{{service_class}} p95",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Goodput",
+      "description": "Засчитываются только запросы, полностью завершённые в пределах SLO. Незавершённый запрос тратит ресурсы, но полезной работой не является (§2.1.2).",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 9
+      },
+      "targets": [
+        {
+          "expr": "sum by (service_class) (rate(gateway_goodput_total[30s]))",
+          "legendFormat": "{{service_class}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 200,
+      "type": "row",
+      "title": "График 3. Классы обслуживания под нагрузкой (§2.2)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "collapsed": false
+    },
+    {
+      "id": 6,
+      "title": "TTFT p95 по классам обслуживания",
+      "description": "Главный график защиты. Реальная боль, ради которой такой прокси и пишут: интерактивный пользователь ждёт минуты, потому что его запрос стоит в одной очереди с батчем. Под перегрузкой interactive обязан держать SLO, batch — растягиваться.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 17
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (service_class,le) (rate(gateway_ttft_seconds_bucket[30s])))",
+          "legendFormat": "{{service_class}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "title": "Глубина очереди по классам",
+      "description": "Очередь живёт на прокси, а не размазана по апстримам (§3.3.3.7) — только поэтому приоритеты вообще могут существовать.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 17
+      },
+      "targets": [
+        {
+          "expr": "sum by (service_class) (gateway_queue_depth)",
+          "legendFormat": "{{service_class}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Отклонённые запросы по причинам",
+      "description": "Честный быстрый 429 лучше таймаута на 120-й секунде: клиент может отступить или уйти в другой класс (§3.3.3).",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 25
+      },
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(gateway_rejected_total[30s]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "title": "Давление контура отклонения",
+      "description": "Сглаженное отношение прогноза TTFT к бюджету SLO. Под постоянной нагрузкой здесь обязана быть ПОЛКА, а не пила: пила означает, что демпфирование сломано (§3.3.3.3).",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 25
+      },
+      "targets": [
+        {
+          "expr": "gateway_load_pressure",
+          "legendFormat": "давление",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "title": "Заблокировано квотами",
+      "description": "Отвечает на вопрос, не задушили ли мы легитимный трафик (§3.3.10).",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 25
+      },
+      "targets": [
+        {
+          "expr": "sum by (tenant,limit_kind) (rate(gateway_quota_blocked_total[1m]))",
+          "legendFormat": "{{tenant}} / {{limit_kind}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 300,
+      "type": "row",
+      "title": "График 2. Отказоустойчивость (§3.3.8)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 32
+      },
+      "collapsed": false
+    },
+    {
+      "id": 11,
+      "title": "Состояние размыкателей",
+      "description": "0 — закрыт, 1 — полуоткрыт, 2 — разомкнут. Отказ апстрима обязан давать кратковременный рост latency, а не всплеск ошибок.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 33
+      },
+      "targets": [
+        {
+          "expr": "gateway_breaker_state",
+          "legendFormat": "{{upstream}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "max": 2,
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "lineInterpolation": "stepAfter"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "title": "Исходы запросов",
+      "description": "Отказ апстрима не должен превращаться в ошибки у клиента: сработает деградация на резервную модель с явной пометкой.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 33
+      },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(gateway_requests_total[30s]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "title": "Деградации и разрывы клиентом",
+      "description": "Каждый разрыв клиентом обязан сопровождаться отменой запроса к апстриму, иначе течёт ёмкость (§3.3.9).",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 33
+      },
+      "targets": [
+        {
+          "expr": "sum by (kind) (rate(gateway_retries_total[1m]))",
+          "legendFormat": "деградация {{kind}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        },
+        {
+          "expr": "sum(rate(gateway_client_disconnects_total[1m]))",
+          "legendFormat": "разрывы клиентом",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 400,
+      "type": "row",
+      "title": "Роутер и кэш (§3.3.6)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 40
+      },
+      "collapsed": false
+    },
+    {
+      "id": 14,
+      "title": "Доля попаданий в префикс-кэш",
+      "description": "Первая из пары метрик, образующих Парето-фронт качества роутера (§2.1).",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 41
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(gateway_prefix_hit_blocks_total[1m])) / clamp_min(sum(rate(gateway_prefix_total_blocks_total[1m])), 1)",
+          "legendFormat": "общая",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        },
+        {
+          "expr": "sum by (upstream) (rate(gateway_prefix_hit_blocks_total[1m])) / clamp_min(sum by (upstream) (rate(gateway_prefix_total_blocks_total[1m])), 1)",
+          "legendFormat": "{{upstream}}",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 15,
+      "title": "Перекос нагрузки по апстримам (CV)",
+      "description": "Вторая метрика Парето-фронта: коэффициент вариации по in-flight токенам. Ноль — идеально равномерно. Численно доказывает отсутствие перекоса (§2.1).",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 41
+      },
+      "targets": [
+        {
+          "expr": "stddev(gateway_inflight_tokens) / clamp_min(avg(gateway_inflight_tokens), 1)",
+          "legendFormat": "CV",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        },
+        {
+          "expr": "max(gateway_inflight_tokens) / clamp_min(avg(gateway_inflight_tokens), 1)",
+          "legendFormat": "max/mean",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 16,
+      "title": "Токены в работе по апстримам",
+      "description": "Метрика нагрузки — токены, а не запросы: запрос на 100k токенов и на 200 нагружают систему на два порядка по-разному (§3.3.6.3).",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 48
+      },
+      "targets": [
+        {
+          "expr": "gateway_inflight_tokens",
+          "legendFormat": "{{upstream}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 17,
+      "title": "Ожидание в очереди прокси",
+      "description": "Ранний индикатор перегрузки (§2.1).",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 48
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (service_class,le) (rate(gateway_queue_wait_seconds_bucket[30s])))",
+          "legendFormat": "{{service_class}} p95",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 18,
+      "title": "Расход токенов по тенантам",
+      "description": "Находит шумного соседа (§3.3.10).",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 48
+      },
+      "targets": [
+        {
+          "expr": "sum by (tenant,direction) (rate(gateway_tokens_total[1m]))",
+          "legendFormat": "{{tenant}} {{direction}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 500,
+      "type": "row",
+      "title": "Control-plane (§3.1)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 55
+      },
+      "collapsed": false
+    },
+    {
+      "id": 19,
+      "title": "Версия применённой конфигурации",
+      "description": "Растёт при каждом успешном hot-reload. Демо гибкости: правим файл — версия меняется, поведение меняется, передеплоя нет (§3.1.1).",
+      "type": "stat",
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 56
+      },
+      "targets": [
+        {
+          "expr": "max(gateway_config_version)",
+          "legendFormat": "версия",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 20,
+      "title": "Запросы в работе по апстримам",
+      "description": "",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 56
+      },
+      "targets": [
+        {
+          "expr": "gateway_inflight_requests",
+          "legendFormat": "{{upstream}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 21,
+      "title": "Ёмкость апстримов: очередь мока",
+      "description": "Наличие необслуженной очереди — бинарный признак занятости апстрима (§3.3.3.7). Фиксированный порог параллелизма здесь не работает: предельное число одновременных запросов гуляет в разы.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 56
+      },
+      "targets": [
+        {
+          "expr": "mock_queued_requests",
+          "legendFormat": "{{instance}} очередь",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        },
+        {
+          "expr": "mock_running_requests",
+          "legendFormat": "{{instance}} в батче",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    }
+  ]
+}

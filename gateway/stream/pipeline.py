@@ -36,6 +36,11 @@ class StreamResult:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     ttft_ms: float = 0.0
+    # TTFT, отсчитанный от момента, когда запрос ушёл апстриму. Разница
+    # с `ttft_ms` — и есть наши накладные расходы: очередь, auth,
+    # admission, роутинг, хеширование. Единственная метрика, за которую
+    # отвечаем мы (§2.1).
+    upstream_ttft_ms: float = 0.0
     total_ms: float = 0.0
     itl_ms: float = 0.0
     finished: bool = False          # дошёл ли стрим до конца
@@ -43,6 +48,18 @@ class StreamResult:
     upstream_id: str = ""
     degraded: bool = False
     degraded_reason: str = ""
+
+    @property
+    def overhead_ms(self) -> float:
+        """Наше время минус время апстрима.
+
+        Если эта величина растёт, проблема в инфраструктуре, а не в
+        модели. Именно её разделение и есть ключевой приём дашборда
+        (§3.3.10): без него рост latency невозможно атрибутировать.
+        """
+        if not self.ttft_ms or not self.upstream_ttft_ms:
+            return 0.0
+        return max(0.0, self.ttft_ms - self.upstream_ttft_ms)
 
     @property
     def goodput_counted(self) -> bool:
@@ -69,6 +86,7 @@ class StreamPipeline:
         result: StreamResult,
         *,
         started_at: float,
+        upstream_started_at: float | None = None,
         degraded_notice: dict | None = None,
     ) -> AsyncIterator[bytes]:
         """Основной цикл. Генератор: отдаёт байты клиенту по мере
@@ -113,6 +131,8 @@ class StreamPipeline:
                     if not emitted:
                         first_token_at = now
                         result.ttft_ms = (now - started_at) * 1000.0
+                        if upstream_started_at is not None:
+                            result.upstream_ttft_ms = (now - upstream_started_at) * 1000.0
                     emitted += 1
                     last_token_at = now
 

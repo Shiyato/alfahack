@@ -315,7 +315,8 @@ class Gateway:
 
         # Размыкатель исключает апстрим до всякого выбора: незачем
         # маршрутизировать на заведомо сломанный.
-        healthy = [u for u in candidates if self.breakers.get(u.id).allows()]
+        healthy_ids = set(self.breakers.healthy([u.id for u in candidates]))
+        healthy = [u for u in candidates if u.id in healthy_ids]
         if not healthy:
             raise AdmissionRejected("все апстримы модели исключены размыкателем",
                                     retry_after_s=5.0, limit_kind="all_open")
@@ -363,6 +364,9 @@ class Gateway:
             u_load.inflight_requests += 1
             u_load.inflight_tokens += request.prompt_tokens_est
             m.inflight.labels(attempt_upstream.id).set(u_load.inflight_requests)
+            # Отсечка для расчёта накладных расходов: всё, что до неё, —
+            # наша работа, всё, что после, — работа апстрима.
+            upstream_started = time.monotonic()
 
             try:
                 response = await self.client.open_stream(request, attempt_upstream, adapter)
@@ -397,7 +401,8 @@ class Gateway:
             async def body() -> AsyncIterator[bytes]:
                 try:
                     async for chunk in self.pipeline.relay(
-                        response, result, started_at=started, degraded_notice=notice
+                        response, result, started_at=started,
+                        upstream_started_at=upstream_started, degraded_notice=notice
                     ):
                         if not guard.first_token_sent:
                             guard.mark_first_token()
@@ -477,6 +482,8 @@ class Gateway:
             u.observed_ttft_ms.update(result.ttft_ms)
         if result.itl_ms:
             m.itl.labels(sc.value, request.model).observe(result.itl_ms / 1000.0)
+        if (oh := result.overhead_ms) > 0:
+            m.overhead.labels(sc.value).observe(oh / 1000.0)
 
         if result.finished:
             breaker.record_success(latency_ms=result.ttft_ms, budget_ms=budget_ms)
@@ -486,7 +493,9 @@ class Gateway:
             if result.ttft_ms <= budget_ms:
                 m.goodput_total.labels(*labels).inc()
         else:
-            breaker.record_failure()
+            # Неполный стрим — мягкий отказ: причин у него много, и
+            # большинство из них на нашей стороне, а не у апстрима.
+            breaker.record_failure(hard=False)
             m.requests_total.labels(*labels, "incomplete").inc()
 
         m.breaker_state.labels(result.upstream_id).set(
